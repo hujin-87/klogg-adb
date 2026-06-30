@@ -90,6 +90,10 @@ extern const char* removeFromFavoritesText;
 extern const char* selectOpenFileText;
 extern const char* predefinedFiltersDialogText;
 extern const char* predefinedFiltersDialogStatusTip;
+extern const char* adbLogcatStartText;
+extern const char* adbLogcatStartStatusTip;
+extern const char* adbLogcatStopText;
+extern const char* adbLogcatStopStatusTip;
 extern const char* autoEncodingText;
 extern const char* autoEncodingStatusTip;
 } // namespace action

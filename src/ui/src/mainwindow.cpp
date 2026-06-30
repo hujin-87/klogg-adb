@@ -58,7 +58,9 @@
 
 #include <QClipboard>
 #include <QCloseEvent>
+#include <QDir>
 #include <QDialogButtonBox>
+#include <QFile>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QInputDialog>
@@ -66,11 +68,13 @@
 #include <QMenuBar>
 #include <QMessageBox>
 #include <QMimeData>
+#include <QProcess>
 #include <QProgressDialog>
 #include <QResource>
 #include <QScreen>
 #include <QShortcut>
 #include <QSortFilterProxyModel>
+#include <QStandardPaths>
 #include <QStringListModel>
 #include <QTemporaryFile>
 #include <QTextBrowser>
@@ -114,6 +118,28 @@ void signalCrawlerToFollowFile( CrawlerWidget* crawler_widget )
 }
 
 static constexpr auto ClipboardMaxTry = 5;
+
+bool adbHasAuthorizedDevice( const QString& adbExecutable )
+{
+    QProcess process;
+    process.start( adbExecutable, QStringList() << QStringLiteral( "devices" ) );
+    if ( !process.waitForFinished( 8000 ) ) {
+        return false;
+    }
+    if ( process.exitCode() != 0 ) {
+        return false;
+    }
+    const auto out = QString::fromUtf8( process.readAllStandardOutput() );
+    const auto lines = out.split( QLatin1Char( '\n' ) );
+    for ( int i = 1; i < lines.size(); ++i ) {
+        const QString line = lines.at( i ).trimmed();
+        if ( line.endsWith( QLatin1String( "\tdevice" ) )
+             || line.endsWith( QLatin1String( " device" ) ) ) {
+            return true;
+        }
+    }
+    return false;
+}
 
 } // namespace
 
@@ -260,6 +286,9 @@ void MainWindow::reloadSession()
         if ( crawler_widget ) {
             mainTabWidget_.addCrawler( crawler_widget, file_name );
 
+            connect( crawler_widget, &CrawlerWidget::colorLabelsChanged, this,
+                     &MainWindow::onColorLabelsChanged );
+
             if ( followFileOnLoad ) {
                 signalCrawlerToFollowFile( crawler_widget );
             }
@@ -399,6 +428,11 @@ void MainWindow::reTranslateUI()
 
     showScratchPadAction->setText( transAction( action::showScratchPadText ) );
     showScratchPadAction->setStatusTip( transAction( action::showScratchPadStatusTip ) );
+
+    adbLogcatStartAction->setText( transAction( action::adbLogcatStartText ) );
+    adbLogcatStartAction->setStatusTip( transAction( action::adbLogcatStartStatusTip ) );
+    adbLogcatStopAction->setText( transAction( action::adbLogcatStopText ) );
+    adbLogcatStopAction->setStatusTip( transAction( action::adbLogcatStopStatusTip ) );
 
     auto curFavoritesIconText = addToFavoritesAction->data().toBool()
                                     ? transAction( action::addToFavoritesText )
@@ -581,7 +615,7 @@ void MainWindow::createActions()
     signalMux_.connect( stopAction, SIGNAL( triggered() ), SLOT( stopLoading() ) );
 
     optionsAction = new QAction( tr( action::optionsText ), this );
-    optionsAction->setMenuRole( QAction::PreferencesRole );
+    optionsAction->setMenuRole( QAction::NoRole );
     optionsAction->setStatusTip( tr( action::optionsStatusTip ) );
     connect( optionsAction, &QAction::triggered, this, [ this ]( auto ) { this->options(); } );
 
@@ -632,6 +666,25 @@ void MainWindow::createActions()
     showScratchPadAction->setStatusTip( tr( action::showScratchPadStatusTip ) );
     connect( showScratchPadAction, &QAction::triggered, this,
              [ this ]( auto ) { this->showScratchPad(); } );
+
+    adbLogcatStartAction = new QAction( tr( action::adbLogcatStartText ), this );
+    adbLogcatStartAction->setStatusTip( tr( action::adbLogcatStartStatusTip ) );
+    adbLogcatStartAction->setShortcut( QKeySequence( Qt::Key_F1 ) );
+    connect( adbLogcatStartAction, &QAction::triggered, this,
+             [ this ]( auto ) { this->startAdbLogcat(); } );
+
+    adbLogcatStopAction = new QAction( tr( action::adbLogcatStopText ), this );
+    adbLogcatStopAction->setStatusTip( tr( action::adbLogcatStopStatusTip ) );
+    adbLogcatStopAction->setShortcut( QKeySequence( Qt::Key_F2 ) );
+    adbLogcatStopAction->setEnabled( false );
+    connect( adbLogcatStopAction, &QAction::triggered, this,
+             [ this ]( auto ) { this->stopAdbLogcat(); } );
+
+    adbLogcatQuickSaveAction = new QAction( tr( "Quick Save(F3)" ), this );
+    adbLogcatQuickSaveAction->setStatusTip( tr( "Save current log with timestamp" ) );
+    adbLogcatQuickSaveAction->setShortcut( QKeySequence( Qt::Key_F3 ) );
+    connect( adbLogcatQuickSaveAction, &QAction::triggered, this,
+             [ this ]( auto ) { this->quickSaveAdbLogcat(); } );
 
     encodingGroup = new QActionGroup( this );
     connect( encodingGroup, &QActionGroup::triggered, this, &MainWindow::encodingChanged );
@@ -810,6 +863,9 @@ void MainWindow::createMenus()
     toolsMenu->addAction( predefinedFiltersDialogAction );
 
     toolsMenu->addSeparator();
+    toolsMenu->addAction( adbLogcatStartAction );
+    toolsMenu->addAction( adbLogcatStopAction );
+    toolsMenu->addSeparator();
     toolsMenu->addAction( showScratchPadAction );
 
     menuBar()->addMenu( EncodingMenu::generate( encodingGroup ) );
@@ -829,6 +885,11 @@ void MainWindow::createMenus()
     helpMenu->addSeparator();
     helpMenu->addAction( aboutQtAction );
     helpMenu->addAction( aboutAction );
+
+    // ADB capture actions in menu bar (right after the last menu)
+    menuBar()->addAction( adbLogcatStartAction );
+    menuBar()->addAction( adbLogcatStopAction );
+    menuBar()->addAction( adbLogcatQuickSaveAction );
 }
 
 void MainWindow::createToolBars()
@@ -1549,6 +1610,8 @@ void MainWindow::closeEvent( QCloseEvent* event )
         this->hide();
     }
     else {
+        cleanupAdbLogcatProcess();
+
         const auto saveSettings = session_.close();
         if ( saveSettings ) {
             writeSettings();
@@ -1779,6 +1842,15 @@ bool MainWindow::loadFile( const QString& fileName, bool followFile )
             // mainTabWidget_.setEnabled( false );
 
             int index = mainTabWidget_.addCrawler( crawler_widget, fileName );
+
+            // Connect color labels signal for cross-tab sync
+            connect( crawler_widget, &CrawlerWidget::colorLabelsChanged, this,
+                     &MainWindow::onColorLabelsChanged );
+
+            // Apply global color labels to the new tab
+            if ( !globalColorLabels_.empty() ) {
+                crawler_widget->restoreColorLabels( globalColorLabels_ );
+            }
 
             // Setting the new tab, the user will see a blank page for the duration
             // of the loading, with no way to switch to another tab
@@ -2260,5 +2332,171 @@ void MainWindow::generateDump()
 
     if ( userAction == QMessageBox::Yes ) {
         throw std::logic_error( "test dump" );
+    }
+}
+
+void MainWindow::cleanupAdbLogcatProcess()
+{
+    if ( adbLogcatProcess_ == nullptr ) {
+        return;
+    }
+
+    adbLogcatProcess_->kill();
+    adbLogcatProcess_->waitForFinished( 500 );
+    adbLogcatProcess_->deleteLater();
+    adbLogcatProcess_ = nullptr;
+
+    if ( adbLogcatStartAction != nullptr ) {
+        adbLogcatStartAction->setEnabled( true );
+    }
+    if ( adbLogcatStopAction != nullptr ) {
+        adbLogcatStopAction->setEnabled( false );
+    }
+}
+
+void MainWindow::stopAdbLogcat()
+{
+    if ( adbLogcatProcess_ == nullptr ) {
+        return;
+    }
+
+    cleanupAdbLogcatProcess();
+}
+
+void MainWindow::startAdbLogcat()
+{
+    if ( adbLogcatProcess_ != nullptr ) {
+        return;
+    }
+
+    const QString adbExecutable = QStandardPaths::findExecutable( QStringLiteral( "adb" ) );
+    if ( adbExecutable.isEmpty() ) {
+        QMessageBox::warning( this, tr( "klogg" ),
+                              tr( "Could not find adb in PATH. Install Android platform-tools." ) );
+        return;
+    }
+
+    if ( !adbHasAuthorizedDevice( adbExecutable ) ) {
+        QMessageBox::warning(
+            this, tr( "klogg" ),
+            tr( "No authorized device found. Connect a device and check \"adb devices\"." ) );
+        return;
+    }
+
+    const auto& config = Configuration::get();
+    if ( !config.anyFileWatchEnabled() ) {
+        QMessageBox::information(
+            this, tr( "klogg" ),
+            tr( "File change monitoring is disabled in Preferences. "
+                "Enable \"Native file watch\" or \"Polling\" so the log view can follow new lines." ) );
+    }
+
+    // Use a fixed path; user can "Quick Save" before next capture to preserve
+    const QString logPath
+        = QDir( QDir::tempPath() ).filePath( QStringLiteral( "klogg_adb_logcat.log" ) );
+
+    // Save search text and color labels from the current tab so we can carry them to the new tab
+    QString previousSearchText;
+    ColorLabelsManager::QuickHighlightersCollection previousColorLabels;
+    if ( auto* currentCrawler = currentCrawlerWidget() ) {
+        previousSearchText = currentCrawler->currentSearchText();
+        previousColorLabels = currentCrawler->currentColorLabels();
+    }
+
+    // If the file is already open in a tab, close that tab first
+    auto* existingView = static_cast<CrawlerWidget*>( session_.getViewIfOpen( logPath ) );
+    if ( existingView ) {
+        int tabIndex = mainTabWidget_.indexOf( existingView );
+        if ( tabIndex >= 0 ) {
+            closeTab( tabIndex, ActionInitiator::App );
+        }
+    }
+
+    // Clear device log buffer
+    QProcess clearProc;
+    clearProc.start( adbExecutable,
+                     QStringList() << QStringLiteral( "logcat" ) << QStringLiteral( "-c" ) );
+    if ( !clearProc.waitForFinished( 15000 ) ) {
+        QMessageBox::critical( this, tr( "klogg" ), tr( "adb logcat -c timed out." ) );
+        return;
+    }
+    if ( clearProc.exitCode() != 0 ) {
+        const auto err = QString::fromUtf8( clearProc.readAllStandardError() );
+        QMessageBox::critical( this, tr( "klogg" ),
+                               tr( "adb logcat -c failed:\n%1" ).arg( err ) );
+        return;
+    }
+
+    adbLogcatFilePath_ = logPath;
+
+    // Start adb logcat process - write directly to file via kernel (no Qt event loop bottleneck)
+    adbLogcatProcess_ = new QProcess( this );
+    adbLogcatProcess_->setStandardOutputFile( logPath, QIODevice::Truncate );
+    adbLogcatProcess_->start( adbExecutable,
+                              QStringList() << QStringLiteral( "logcat" ) << QStringLiteral( "-v" )
+                                            << QStringLiteral( "threadtime" ) );
+    if ( !adbLogcatProcess_->waitForStarted( 5000 ) ) {
+        QMessageBox::critical( this, tr( "klogg" ), tr( "Could not start adb logcat." ) );
+        adbLogcatProcess_->deleteLater();
+        adbLogcatProcess_ = nullptr;
+        return;
+    }
+
+    // Open the file in klogg with follow mode
+    if ( !loadFile( logPath, true ) ) {
+        cleanupAdbLogcatProcess();
+        return;
+    }
+
+    // Set search text from previous tab and enable auto-refresh for real-time filtering
+    // Also restore color labels (Ctrl+D highlights) from previous tab
+    if ( auto* crawler = currentCrawlerWidget() ) {
+        crawler->startSearchWithAutoRefresh( previousSearchText );
+        if ( !previousColorLabels.empty() ) {
+            crawler->restoreColorLabels( previousColorLabels );
+        }
+    }
+
+    adbLogcatStartAction->setEnabled( false );
+    adbLogcatStopAction->setEnabled( true );
+}
+
+void MainWindow::quickSaveAdbLogcat()
+{
+    const QString logPath
+        = QDir( QDir::tempPath() ).filePath( QStringLiteral( "klogg_adb_logcat.log" ) );
+    QFileInfo fileInfo( logPath );
+    if ( !fileInfo.exists() || fileInfo.size() == 0 ) {
+        QMessageBox::information( this, tr( "klogg" ), tr( "No log file to save." ) );
+        return;
+    }
+
+    const QString timestamp
+        = QDateTime::currentDateTime().toString( QStringLiteral( "yyyyMMdd_HHmmss" ) );
+    const QString savePath = QDir( QDir::tempPath() )
+                                 .filePath( QStringLiteral( "klogg_adb_logcat_%1.log" ).arg( timestamp ) );
+
+    if ( QFile::copy( logPath, savePath ) ) {
+        QMessageBox::information(
+            this, tr( "klogg" ),
+            tr( "Log saved to:\n%1" ).arg( QDir::toNativeSeparators( savePath ) ) );
+    }
+    else {
+        QMessageBox::warning( this, tr( "klogg" ), tr( "Failed to save log file." ) );
+    }
+}
+
+void MainWindow::onColorLabelsChanged(
+    const ColorLabelsManager::QuickHighlightersCollection& labels )
+{
+    globalColorLabels_ = labels;
+
+    // Apply to all other tabs
+    auto* senderCrawler = qobject_cast<CrawlerWidget*>( sender() );
+    for ( int i = 0; i < mainTabWidget_.count(); ++i ) {
+        auto* crawler = qobject_cast<CrawlerWidget*>( mainTabWidget_.widget( i ) );
+        if ( crawler && crawler != senderCrawler ) {
+            crawler->restoreColorLabels( labels );
+        }
     }
 }

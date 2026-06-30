@@ -49,6 +49,9 @@
 #include <memory>
 #include <mutex>
 
+class QFile;
+class QProcess;
+
 #include "configuration.h"
 #include "crawlerwidget.h"
 #include "downloader.h"
@@ -135,6 +138,10 @@ class MainWindow : public QMainWindow {
     void removeFromFavorites();
     void selectOpenedFile();
     void generateDump();
+    void startAdbLogcat();
+    void stopAdbLogcat();
+    void quickSaveAdbLogcat();
+    void onColorLabelsChanged( const ColorLabelsManager::QuickHighlightersCollection& labels );
 
     // Change the view settings
     void toggleOverviewVisibility( bool isVisible );
@@ -219,6 +226,7 @@ class MainWindow : public QMainWindow {
     void removeFromRecent( const QString& pathToRemove );
     void tryOpenClipboard( int tryTimes );
     void updateShortcuts();
+    void cleanupAdbLogcatProcess();
 
     WindowSession session_;
     QString loadingFileName;
@@ -278,6 +286,9 @@ class MainWindow : public QMainWindow {
     QAction* joinDiscordAction;
     QAction* joinTelegramAction;
     QAction* generateDumpAction;
+    QAction* adbLogcatStartAction;
+    QAction* adbLogcatStopAction;
+    QAction* adbLogcatQuickSaveAction;
     QActionGroup* encodingGroup;
     QAction* addToFavoritesAction;
     QAction* addToFavoritesMenuAction;
@@ -314,6 +325,11 @@ class MainWindow : public QMainWindow {
     TabbedScratchPad scratchPad_;
 
     QTemporaryDir tempDir_;
+
+    QProcess* adbLogcatProcess_ = nullptr;
+    QString adbLogcatFilePath_;
+
+    ColorLabelsManager::QuickHighlightersCollection globalColorLabels_;
 
     bool isMaximized_ = false;
     bool isCloseFromTray_ = false;

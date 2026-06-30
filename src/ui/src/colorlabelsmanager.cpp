@@ -94,3 +94,12 @@ ColorLabelsManager::updateColorLabel( size_t label, const QString& text, bool re
 
     return quickHighlighters_;
 }
+
+void ColorLabelsManager::restoreLabels( const QuickHighlightersCollection& labels )
+{
+    quickHighlighters_ = labels;
+    // Ensure vector has at least 9 slots
+    if ( quickHighlighters_.size() < 9 ) {
+        quickHighlighters_.resize( 9 );
+    }
+}

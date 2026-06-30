@@ -124,6 +124,21 @@ class CrawlerWidget : public QSplitter,
     void focusSearchEdit();
     void goToLine();
 
+    // Enable search auto-refresh so filtered view updates in real-time
+    void enableSearchAutoRefresh();
+
+    // Get current search text from the search line edit
+    QString currentSearchText() const;
+
+    // Set search text, start the search, and enable auto-refresh
+    void startSearchWithAutoRefresh( const QString& searchText );
+
+    // Get current quick highlight color labels
+    ColorLabelsManager::QuickHighlightersCollection currentColorLabels() const;
+
+    // Restore quick highlight color labels from a previous tab
+    void restoreColorLabels( const ColorLabelsManager::QuickHighlightersCollection& labels );
+
     // Instructs the widget to reconfigure itself because Config() has changed.
     void applyConfiguration();
 
@@ -174,6 +189,9 @@ class CrawlerWidget : public QSplitter,
 
     // "auto-refresh" check has been changed
     void searchRefreshChanged( bool isRefreshing );
+
+    // Color labels (Ctrl+D highlights) changed in this tab
+    void colorLabelsChanged( const ColorLabelsManager::QuickHighlightersCollection& labels );
     // "ignore case" check has been changed
     void matchCaseChanged( bool matchCase );
 

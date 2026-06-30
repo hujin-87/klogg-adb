@@ -22,6 +22,8 @@
 #include <QApplication>
 #include <QClipboard>
 #include <QDir>
+#include <QFile>
+#include <QFileDialog>
 #include <QFileInfo>
 #include <QInputDialog>
 #include <QKeyEvent>
@@ -200,6 +202,7 @@ void TabbedCrawlerWidget::showContextMenu( int tab, QPoint globalPoint )
     menu.addSeparator();
     auto copyFullPath = menu.addAction( tr( "Copy full path" ) );
     auto openContainingFolder = menu.addAction( tr( "Open containing folder" ) );
+    auto saveAs = menu.addAction( tr( "Save As..." ) );
     menu.addSeparator();
     auto renameTab = menu.addAction( tr( "Rename tab" ) );
     auto resetTabName = menu.addAction( tr( "Reset tab name" ) );
@@ -247,6 +250,19 @@ void TabbedCrawlerWidget::showContextMenu( int tab, QPoint globalPoint )
 
     connect( openContainingFolder, &QAction::triggered, this,
              [ this, tab ] { showPathInFileExplorer( tabToolTip( tab ) ); } );
+
+    connect( saveAs, &QAction::triggered, this, [ this, tab ] {
+        const auto sourcePath = tabPathAt( tab );
+        const auto defaultName = QFileInfo( sourcePath ).fileName();
+        const auto savePath = QFileDialog::getSaveFileName(
+            this, tr( "Save As" ), defaultName, tr( "Log files (*.log);;All files (*)" ) );
+        if ( !savePath.isEmpty() ) {
+            if ( QFile::exists( savePath ) ) {
+                QFile::remove( savePath );
+            }
+            QFile::copy( sourcePath, savePath );
+        }
+    } );
 
     connect( renameTab, &QAction::triggered, this, [ this, tab ] {
         bool isNameEntered = false;

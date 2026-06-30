@@ -96,6 +96,11 @@ const char* action::selectOpenFileText = QT_TR_NOOP( "Switch to opened file..." 
 const char* action::predefinedFiltersDialogText = QT_TR_NOOP( "Predefined filters..." );
 const char* action::predefinedFiltersDialogStatusTip
     = QT_TR_NOOP( "Show dialog to configure filters" );
+const char* action::adbLogcatStartText = QT_TR_NOOP( "adb logcat start(F1)" );
+const char* action::adbLogcatStartStatusTip
+    = QT_TR_NOOP( "Clear device log and start adb logcat capture" );
+const char* action::adbLogcatStopText = QT_TR_NOOP( "adb logcat stop(F2)" );
+const char* action::adbLogcatStopStatusTip = QT_TR_NOOP( "Stop adb logcat process; log file remains open" );
 const char* action::autoEncodingText = QT_TR_NOOP( "Auto" );
 const char* action::autoEncodingStatusTip
     = QT_TR_NOOP( "Automatically detect the file's encoding" );

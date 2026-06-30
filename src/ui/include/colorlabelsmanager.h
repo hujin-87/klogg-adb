@@ -37,6 +37,9 @@ class ColorLabelsManager {
 
     QuickHighlightersCollection clear();
 
+    // Restore previously saved color labels
+    void restoreLabels( const QuickHighlightersCollection& labels );
+
   private:
     QuickHighlightersCollection updateColorLabel( size_t label, const QString& text,
                                                   bool replaceCurrent );

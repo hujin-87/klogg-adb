@@ -803,6 +803,47 @@ void CrawlerWidget::searchRefreshChangedHandler( bool isRefreshing )
     printSearchInfoMessage( logFilteredData_->getNbMatches() );
 }
 
+void CrawlerWidget::enableSearchAutoRefresh()
+{
+    if ( !searchRefreshButton_->isChecked() ) {
+        searchRefreshButton_->setChecked( true );
+    }
+}
+
+QString CrawlerWidget::currentSearchText() const
+{
+    return searchLineEdit_->currentText();
+}
+
+void CrawlerWidget::startSearchWithAutoRefresh( const QString& searchText )
+{
+    // Enable auto-refresh first so startSearch() transitions to Autorefreshing
+    if ( !searchRefreshButton_->isChecked() ) {
+        searchRefreshButton_->setChecked( true );
+    }
+
+    if ( !searchText.isEmpty() ) {
+        searchLineEdit_->setEditText( searchText );
+        updatePredefinedFiltersWidget();
+        // Trigger the search
+        startNewSearch();
+    }
+}
+
+ColorLabelsManager::QuickHighlightersCollection CrawlerWidget::currentColorLabels() const
+{
+    return colorLabelsManager_.colorLabels();
+}
+
+void CrawlerWidget::restoreColorLabels(
+    const ColorLabelsManager::QuickHighlightersCollection& labels )
+{
+    colorLabelsManager_.restoreLabels( labels );
+    // Apply to views directly without emitting signal (avoids infinite loop)
+    logMainView_->setQuickHighlighters( labels );
+    filteredView_->setQuickHighlighters( labels );
+}
+
 void CrawlerWidget::matchCaseChangedHandler( bool shouldMatchCase )
 {
     searchLineCompleter_->setCaseSensitivity( shouldMatchCase ? Qt::CaseSensitive
@@ -1750,6 +1791,7 @@ void CrawlerWidget::updateColorLabels(
 {
     logMainView_->setQuickHighlighters( labels );
     filteredView_->setQuickHighlighters( labels );
+    Q_EMIT colorLabelsChanged( labels );
 }
 
 //
