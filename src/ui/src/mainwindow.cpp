@@ -2412,6 +2412,16 @@ void MainWindow::startAdbLogcat()
         }
     }
 
+    // Increase device log buffer size before capturing (best-effort).
+    // Some buffers (e.g. kernel) may not be resizable on all devices, which makes
+    // adb return non-zero even when the other buffers were enlarged, so we don't
+    // treat a failure here as fatal - capture can still proceed.
+    QProcess setBufferProc;
+    setBufferProc.start( adbExecutable,
+                         QStringList() << QStringLiteral( "logcat" ) << QStringLiteral( "-G" )
+                                       << QStringLiteral( "512M" ) );
+    setBufferProc.waitForFinished( 15000 );
+
     // Clear device log buffer
     QProcess clearProc;
     clearProc.start( adbExecutable,
