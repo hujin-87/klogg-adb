@@ -287,7 +287,14 @@ if(efsw_ADDED)
 endif()
 
 if(WIN32)
-  set(BUILD_SHARED_LIBS ON)
+  # MSVC exports TBB symbols from a DLL, but MinGW/GCC does not, leaving the
+  # tbb::detail::r1::* runtime symbols unresolved at link time. Build TBB
+  # statically for MinGW cross-builds; keep the shared DLL for MSVC.
+  if(MINGW)
+    set(BUILD_SHARED_LIBS OFF)
+  else()
+    set(BUILD_SHARED_LIBS ON)
+  endif()
 endif()
 cpmaddpackage(
   NAME

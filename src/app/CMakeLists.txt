@@ -6,11 +6,22 @@ endif()
 
 configure_file(${CMAKE_CURRENT_SOURCE_DIR}/documentation.qrc.in ${DOCUMENTATION_RESOURCE} @ONLY)
 
-add_custom_command(
-  OUTPUT ${DOCUMENTATION_HTML}
-  COMMAND $<TARGET_FILE:maddy> ${DOCUMENTATION_FILE} ${DOCUMENTATION_HTML}
-  DEPENDS maddy ${DOCUMENTATION_FILE}
-)
+if(KLOGG_HOST_MADDY)
+  # When cross-compiling, the maddy target is built for the host target and
+  # cannot run on the build machine; use a host-native maddy provided by the
+  # caller to generate the documentation at build time.
+  add_custom_command(
+    OUTPUT ${DOCUMENTATION_HTML}
+    COMMAND ${KLOGG_HOST_MADDY} ${DOCUMENTATION_FILE} ${DOCUMENTATION_HTML}
+    DEPENDS ${DOCUMENTATION_FILE}
+  )
+else()
+  add_custom_command(
+    OUTPUT ${DOCUMENTATION_HTML}
+    COMMAND $<TARGET_FILE:maddy> ${DOCUMENTATION_FILE} ${DOCUMENTATION_HTML}
+    DEPENDS maddy ${DOCUMENTATION_FILE}
+  )
+endif()
 
 set(TS_FILES
   ${CMAKE_CURRENT_SOURCE_DIR}/i18n/en.ts

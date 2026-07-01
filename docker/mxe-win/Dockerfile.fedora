@@ -1,0 +1,26 @@
+FROM fedora:40
+
+# Cross toolchain (GCC 14) + prebuilt Qt5 for MinGW-w64 x86_64, plus host build tools.
+# mingw64-* packages install into /usr/x86_64-w64-mingw32/sys-root/mingw.
+RUN dnf -y install \
+        mingw64-gcc mingw64-gcc-c++ \
+        mingw64-winpthreads-static \
+        mingw64-qt5-qtbase mingw64-qt5-qttools \
+        mingw64-boost \
+        mingw64-openssl \
+        gcc gcc-c++ \
+        cmake ninja-build make ragel git python3 \
+        qt5-linguist \
+        findutils file which \
+    && dnf clean all
+
+# mingw64-filesystem provides the mingw64-cmake wrapper and RPM macros pointing
+# CMAKE_TOOLCHAIN_FILE at the MinGW toolchain.
+
+# The MinGW Qt package ships native moc/uic/rcc but not runnable linguist host
+# tools; point the paths Qt5LinguistTools expects at Fedora's native ones.
+RUN for t in lrelease lupdate lconvert; do \
+        ln -sf /usr/bin/$t-qt5 /usr/x86_64-w64-mingw32/bin/qt5/$t; \
+    done
+
+WORKDIR /src
