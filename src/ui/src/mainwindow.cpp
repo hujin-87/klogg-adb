@@ -2487,9 +2487,8 @@ void MainWindow::quickSaveAdbLogcat()
                                  .filePath( QStringLiteral( "klogg_adb_logcat_%1.log" ).arg( timestamp ) );
 
     if ( QFile::copy( logPath, savePath ) ) {
-        QMessageBox::information(
-            this, tr( "klogg" ),
-            tr( "Log saved to:\n%1" ).arg( QDir::toNativeSeparators( savePath ) ) );
+        // Open the containing folder and select the saved file.
+        showPathInFileExplorer( savePath );
     }
     else {
         QMessageBox::warning( this, tr( "klogg" ), tr( "Failed to save log file." ) );
