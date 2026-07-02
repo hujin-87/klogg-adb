@@ -2502,7 +2502,9 @@ void MainWindow::quickSaveAdbLogcat()
     }
 
 #if defined( Q_OS_LINUX )
-    // Show the saved path in a popup that counts down and auto-closes after 15s.
+    // Open the containing folder, and show the saved path in a popup that
+    // counts down and auto-closes after a few seconds.
+    showPathInFileExplorer( savePath );
     showAutoClosingSavedDialog( savePath );
 #else
     // Open the containing folder and select the saved file.
@@ -2512,7 +2514,7 @@ void MainWindow::quickSaveAdbLogcat()
 
 void MainWindow::showAutoClosingSavedDialog( const QString& savePath )
 {
-    static constexpr int kCountdownSeconds = 15;
+    static constexpr int kCountdownSeconds = 5;
 
     auto* box = new QMessageBox( QMessageBox::Information, tr( "klogg" ),
                                  tr( "Log saved to:\n%1" ).arg( QDir::toNativeSeparators( savePath ) ),
