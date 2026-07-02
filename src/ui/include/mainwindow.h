@@ -51,6 +51,7 @@
 
 class QFile;
 class QProcess;
+class QTimer;
 
 #include "configuration.h"
 #include "crawlerwidget.h"
@@ -141,6 +142,9 @@ class MainWindow : public QMainWindow {
     void startAdbLogcat();
     void stopAdbLogcat();
     void quickSaveAdbLogcat();
+    void killCameraAdb();
+    void updateCameraProviderPid();
+    void applyCameraProviderPid( const QString& pid );
     void showAutoClosingSavedDialog( const QString& savePath );
     void onColorLabelsChanged( const ColorLabelsManager::QuickHighlightersCollection& labels );
 
@@ -290,6 +294,7 @@ class MainWindow : public QMainWindow {
     QAction* adbLogcatStartAction;
     QAction* adbLogcatStopAction;
     QAction* adbLogcatQuickSaveAction;
+    QAction* adbKillCameraAction;
     QActionGroup* encodingGroup;
     QAction* addToFavoritesAction;
     QAction* addToFavoritesMenuAction;
@@ -329,6 +334,9 @@ class MainWindow : public QMainWindow {
 
     QProcess* adbLogcatProcess_ = nullptr;
     QString adbLogcatFilePath_;
+
+    QProcess* cameraPidProcess_ = nullptr;
+    QTimer* cameraPidTimer_ = nullptr;
 
     ColorLabelsManager::QuickHighlightersCollection globalColorLabels_;
 

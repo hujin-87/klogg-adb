@@ -78,6 +78,7 @@
 #include <QStringListModel>
 #include <QTemporaryFile>
 #include <QTextBrowser>
+#include <QTimer>
 #include <QToolBar>
 #include <QToolTip>
 #include <QUrl>
@@ -139,6 +140,19 @@ bool adbHasAuthorizedDevice( const QString& adbExecutable )
         }
     }
     return false;
+}
+
+// Compile date derived from the __DATE__ macro ("Mmm dd yyyy"), formatted as
+// "yy.m.d" without zero padding, e.g. "Jul  2 2026" -> "26.7.2".
+QString kloggCompileDate()
+{
+    const char* d = __DATE__;
+    static const char* const months = "JanFebMarAprMayJunJulAugSepOctNovDec";
+    const QString monthStr = QString::fromLatin1( d, 3 );
+    const int monthIndex = QString::fromLatin1( months ).indexOf( monthStr ) / 3 + 1;
+    const int day = QString::fromLatin1( d + 4, 2 ).trimmed().toInt();
+    const int year = QString::fromLatin1( d + 7, 4 ).toInt() % 100;
+    return QStringLiteral( "%1.%2.%3" ).arg( year ).arg( monthIndex ).arg( day );
 }
 
 } // namespace
@@ -686,6 +700,20 @@ void MainWindow::createActions()
     connect( adbLogcatQuickSaveAction, &QAction::triggered, this,
              [ this ]( auto ) { this->quickSaveAdbLogcat(); } );
 
+    adbKillCameraAction = new QAction( tr( "Kill Camera(F4)" ), this );
+    adbKillCameraAction->setStatusTip( tr( "Run adb root and kill camera processes" ) );
+    adbKillCameraAction->setShortcut( QKeySequence( Qt::Key_F4 ) );
+    connect( adbKillCameraAction, &QAction::triggered, this,
+             [ this ]( auto ) { this->killCameraAdb(); } );
+
+    // Poll the camera provider PID every 3 seconds and mirror it in the F4 label.
+    cameraPidTimer_ = new QTimer( this );
+    cameraPidTimer_->setInterval( 3000 );
+    connect( cameraPidTimer_, &QTimer::timeout, this,
+             [ this ]() { this->updateCameraProviderPid(); } );
+    cameraPidTimer_->start();
+    updateCameraProviderPid();
+
     encodingGroup = new QActionGroup( this );
     connect( encodingGroup, &QActionGroup::triggered, this, &MainWindow::encodingChanged );
 
@@ -890,6 +918,7 @@ void MainWindow::createMenus()
     menuBar()->addAction( adbLogcatStartAction );
     menuBar()->addAction( adbLogcatStopAction );
     menuBar()->addAction( adbLogcatQuickSaveAction );
+    menuBar()->addAction( adbKillCameraAction );
 }
 
 void MainWindow::createToolBars()
@@ -1905,7 +1934,7 @@ void MainWindow::updateTitleBar( const QString& file_name )
     }
 
     setWindowTitle( tr( "%1 - %2%3" ).arg( shownName, tr( "klogg" ), indexPart ) + tr( " (build " )
-                    + kloggVersion() + ")" );
+                    + kloggVersion() + ")-" + kloggCompileDate() );
 }
 
 void MainWindow::addRecentFile( const QString& fileName )
@@ -2510,6 +2539,102 @@ void MainWindow::quickSaveAdbLogcat()
     // Open the containing folder and select the saved file.
     showPathInFileExplorer( savePath );
 #endif
+}
+
+void MainWindow::killCameraAdb()
+{
+    const QString adbExecutable = QStandardPaths::findExecutable( QStringLiteral( "adb" ) );
+    if ( adbExecutable.isEmpty() ) {
+        QMessageBox::warning( this, tr( "klogg" ),
+                              tr( "Could not find adb in PATH. Install Android platform-tools." ) );
+        return;
+    }
+
+    if ( !adbHasAuthorizedDevice( adbExecutable ) ) {
+        QMessageBox::warning(
+            this, tr( "klogg" ),
+            tr( "No authorized device found. Connect a device and check \"adb devices\"." ) );
+        return;
+    }
+
+    // Restart adbd with root permissions (best-effort; may already be root or
+    // unsupported on production builds).
+    QProcess rootProc;
+    rootProc.start( adbExecutable, QStringList() << QStringLiteral( "root" ) );
+    rootProc.waitForFinished( 15000 );
+
+    // Kill any process whose command line matches "camera".
+    QProcess killProc;
+    killProc.start( adbExecutable, QStringList() << QStringLiteral( "shell" )
+                                                 << QStringLiteral( "pkill" )
+                                                 << QStringLiteral( "-f" )
+                                                 << QStringLiteral( "camera" ) );
+    if ( !killProc.waitForFinished( 15000 ) ) {
+        QMessageBox::critical( this, tr( "klogg" ), tr( "adb shell pkill timed out." ) );
+        return;
+    }
+
+    // pkill returns non-zero (1) when no process matched, which is not an error
+    // worth surfacing; only report genuine execution failures.
+    const int exitCode = killProc.exitCode();
+    if ( exitCode != 0 && exitCode != 1 ) {
+        const auto err = QString::fromUtf8( killProc.readAllStandardError() );
+        QMessageBox::critical( this, tr( "klogg" ),
+                               tr( "adb shell pkill -f camera failed:\n%1" ).arg( err ) );
+    }
+
+    // The kill just changed the process table; refresh the F4 label right away.
+    updateCameraProviderPid();
+}
+
+void MainWindow::updateCameraProviderPid()
+{
+    // Skip if a previous query is still running to avoid piling up processes.
+    if ( cameraPidProcess_ && cameraPidProcess_->state() != QProcess::NotRunning ) {
+        return;
+    }
+
+    const QString adbExecutable = QStandardPaths::findExecutable( QStringLiteral( "adb" ) );
+    if ( adbExecutable.isEmpty() ) {
+        applyCameraProviderPid( QString() );
+        return;
+    }
+
+    if ( !cameraPidProcess_ ) {
+        cameraPidProcess_ = new QProcess( this );
+        connect(
+            cameraPidProcess_,
+            static_cast<void ( QProcess::* )( int, QProcess::ExitStatus )>( &QProcess::finished ),
+            this, [ this ]( int, QProcess::ExitStatus ) {
+                const auto output
+                    = QString::fromUtf8( cameraPidProcess_->readAllStandardOutput() );
+                QString pid;
+                const auto lines = output.split( QLatin1Char( '\n' ) );
+                for ( const auto& line : lines ) {
+                    if ( !line.contains( QStringLiteral( "camera.provider" ),
+                                         Qt::CaseInsensitive ) ) {
+                        continue;
+                    }
+                    // ps -ef columns: UID PID PPID ... ; the PID is the 2nd field.
+                    const auto fields = line.simplified().split( QLatin1Char( ' ' ) );
+                    if ( fields.size() >= 2 ) {
+                        pid = fields.at( 1 );
+                        break;
+                    }
+                }
+                applyCameraProviderPid( pid );
+            } );
+    }
+
+    cameraPidProcess_->start( adbExecutable, QStringList() << QStringLiteral( "shell" )
+                                                           << QStringLiteral( "ps" )
+                                                           << QStringLiteral( "-ef" ) );
+}
+
+void MainWindow::applyCameraProviderPid( const QString& pid )
+{
+    const QString shown = pid.isEmpty() ? QStringLiteral( "hujin" ) : pid;
+    adbKillCameraAction->setText( tr( "Kill Camera(F4) [%1]" ).arg( shown ) );
 }
 
 void MainWindow::showAutoClosingSavedDialog( const QString& savePath )
