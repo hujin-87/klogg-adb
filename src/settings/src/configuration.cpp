@@ -343,6 +343,24 @@ void Configuration::retrieveFromStorage( QSettings& settings )
     }
     settings.endArray();
 
+    // Migration: F3 is now reserved for the ADB "Quick Save" action. Older configs
+    // (saved via the Shortcuts preferences dialog) may still bind F3 to the main-view
+    // "find next" action, which produces an ambiguous-shortcut conflict so neither
+    // fires. Strip any FindNext standard key (F3 on Windows/Linux) from that mapping.
+    QStringList findNextConflicts;
+    for ( const auto& seq : QKeySequence::keyBindings( QKeySequence::FindNext ) ) {
+        findNextConflicts << seq.toString();
+    }
+    const auto qfForward = shortcuts_.find( ShortcutAction::LogViewQfForward );
+    if ( qfForward != shortcuts_.end() ) {
+        auto& keys = qfForward->second;
+        keys.erase( std::remove_if( keys.begin(), keys.end(),
+                                    [ &findNextConflicts ]( const QString& key ) {
+                                        return findNextConflicts.contains( key );
+                                    } ),
+                    keys.end() );
+    }
+
     settings.beginGroup( "dark" );
     for ( auto& color : darkPalette_ ) {
         color.second = settings.value( color.first, color.second ).toString();

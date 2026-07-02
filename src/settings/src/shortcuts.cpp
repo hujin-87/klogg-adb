@@ -496,8 +496,10 @@ const ShortcutAction::ShortcutList& ShortcutAction::defaultShortcutList()
             LogViewQfForward,
             {
                 QApplication::tr( "Main view: find next" ),
-                getKeyBindings( QKeySequence::FindNext )
-                    << QKeySequence( Qt::Key_N ).toString() << "Ctrl+G",
+                // NOTE: QKeySequence::FindNext maps to F3 on Windows/Linux, which now
+                // conflicts with the ADB "Quick Save" action (F3). Drop the standard
+                // FindNext binding here so F3 belongs to Quick Save; N / Ctrl+G remain.
+                QStringList{ QKeySequence( Qt::Key_N ).toString() } << "Ctrl+G",
             },
         },
         {
