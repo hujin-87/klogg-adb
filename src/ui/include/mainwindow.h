@@ -141,6 +141,7 @@ class MainWindow : public QMainWindow {
     void startAdbLogcat();
     void stopAdbLogcat();
     void quickSaveAdbLogcat();
+    void showAutoClosingSavedDialog( const QString& savePath );
     void onColorLabelsChanged( const ColorLabelsManager::QuickHighlightersCollection& labels );
 
     // Change the view settings

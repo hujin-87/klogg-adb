@@ -2483,16 +2483,64 @@ void MainWindow::quickSaveAdbLogcat()
 
     const QString timestamp
         = QDateTime::currentDateTime().toString( QStringLiteral( "yyyyMMdd_HHmmss" ) );
-    const QString savePath = QDir( QDir::tempPath() )
-                                 .filePath( QStringLiteral( "klogg_adb_logcat_%1.log" ).arg( timestamp ) );
 
-    if ( QFile::copy( logPath, savePath ) ) {
-        // Open the containing folder and select the saved file.
-        showPathInFileExplorer( savePath );
+#if defined( Q_OS_LINUX )
+    // On Linux save into a dedicated /tmp/0_klogg/ directory.
+    QDir saveDir( QStringLiteral( "/tmp/0_klogg" ) );
+    if ( !saveDir.exists() ) {
+        saveDir.mkpath( QStringLiteral( "." ) );
     }
-    else {
+#else
+    QDir saveDir( QDir::tempPath() );
+#endif
+    const QString savePath
+        = saveDir.filePath( QStringLiteral( "klogg_adb_logcat_%1.log" ).arg( timestamp ) );
+
+    if ( !QFile::copy( logPath, savePath ) ) {
         QMessageBox::warning( this, tr( "klogg" ), tr( "Failed to save log file." ) );
+        return;
     }
+
+#if defined( Q_OS_LINUX )
+    // Show the saved path in a popup that counts down and auto-closes after 15s.
+    showAutoClosingSavedDialog( savePath );
+#else
+    // Open the containing folder and select the saved file.
+    showPathInFileExplorer( savePath );
+#endif
+}
+
+void MainWindow::showAutoClosingSavedDialog( const QString& savePath )
+{
+    static constexpr int kCountdownSeconds = 15;
+
+    auto* box = new QMessageBox( QMessageBox::Information, tr( "klogg" ),
+                                 tr( "Log saved to:\n%1" ).arg( QDir::toNativeSeparators( savePath ) ),
+                                 QMessageBox::Ok, this );
+    box->setAttribute( Qt::WA_DeleteOnClose );
+
+    const auto updateCountdown = [ box ]( int remaining ) {
+        box->setInformativeText(
+            tr( "This dialog will close automatically in %1 s" ).arg( remaining ) );
+    };
+    updateCountdown( kCountdownSeconds );
+
+    auto* timer = new QTimer( box );
+    box->setProperty( "remainingSeconds", kCountdownSeconds );
+    connect( timer, &QTimer::timeout, box, [ box, timer, updateCountdown ]() {
+        const int remaining = box->property( "remainingSeconds" ).toInt() - 1;
+        box->setProperty( "remainingSeconds", remaining );
+        if ( remaining <= 0 ) {
+            timer->stop();
+            box->accept();
+        }
+        else {
+            updateCountdown( remaining );
+        }
+    } );
+    timer->start( 1000 );
+
+    box->show();
 }
 
 void MainWindow::onColorLabelsChanged(
