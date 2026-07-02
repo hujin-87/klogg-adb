@@ -347,10 +347,13 @@ void Configuration::retrieveFromStorage( QSettings& settings )
     // (saved via the Shortcuts preferences dialog) may still bind F3 to the main-view
     // "find next" action, which produces an ambiguous-shortcut conflict so neither
     // fires. Strip any FindNext standard key (F3 on Windows/Linux) from that mapping.
-    QStringList findNextConflicts;
-    for ( const auto& seq : QKeySequence::keyBindings( QKeySequence::FindNext ) ) {
-        findNextConflicts << seq.toString();
-    }
+    // NOTE: QKeySequence::keyBindings() must not be called here. retrieveFromStorage
+    // runs from Configuration::getSynced() in main() *before* the QApplication object
+    // is constructed, and keyBindings() dereferences the platform theme via
+    // QGuiApplication, which segfaults when no application instance exists. The
+    // FindNext standard key on Windows/Linux is F3 (the key reserved for ADB Quick
+    // Save), so match it directly instead.
+    const QStringList findNextConflicts{ QStringLiteral( "F3" ) };
     const auto qfForward = shortcuts_.find( ShortcutAction::LogViewQfForward );
     if ( qfForward != shortcuts_.end() ) {
         auto& keys = qfForward->second;
