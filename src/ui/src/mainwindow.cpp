@@ -2514,7 +2514,7 @@ void MainWindow::quickSaveAdbLogcat()
 
 void MainWindow::showAutoClosingSavedDialog( const QString& savePath )
 {
-    static constexpr int kCountdownSeconds = 5;
+    static constexpr int kCountdownSeconds = 2;
 
     auto* box = new QMessageBox( QMessageBox::Information, tr( "klogg" ),
                                  tr( "Log saved to:\n%1" ).arg( QDir::toNativeSeparators( savePath ) ),
