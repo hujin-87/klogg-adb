@@ -63,3 +63,6 @@ website/resources/
 
 # Windows cross-build output
 build_win/
+
+# my_make.sh 统一产物目录
+output/
