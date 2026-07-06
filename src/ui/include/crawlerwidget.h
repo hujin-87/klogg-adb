@@ -133,6 +133,10 @@ class CrawlerWidget : public QSplitter,
     // Set search text, start the search, and enable auto-refresh
     void startSearchWithAutoRefresh( const QString& searchText );
 
+    // Get/set the current "match case" (case sensitivity) state of the search
+    bool currentMatchCase() const;
+    void setMatchCase( bool matchCase );
+
     // Get current quick highlight color labels
     ColorLabelsManager::QuickHighlightersCollection currentColorLabels() const;
 

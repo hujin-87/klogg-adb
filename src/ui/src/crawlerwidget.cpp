@@ -835,6 +835,16 @@ ColorLabelsManager::QuickHighlightersCollection CrawlerWidget::currentColorLabel
     return colorLabelsManager_.colorLabels();
 }
 
+bool CrawlerWidget::currentMatchCase() const
+{
+    return matchCaseButton_->isChecked();
+}
+
+void CrawlerWidget::setMatchCase( bool matchCase )
+{
+    matchCaseButton_->setChecked( matchCase );
+}
+
 void CrawlerWidget::restoreColorLabels(
     const ColorLabelsManager::QuickHighlightersCollection& labels )
 {
