@@ -40,6 +40,39 @@
 
 #include "log.h"
 
+namespace {
+// Some externally-produced filter configs store non-ASCII text as escaped UTF-8
+// *bytes* (e.g. "\xe7\x9b\xb8" for 相). Qt's INI reader interprets "\xNN" as a
+// Unicode code point instead, so such a value comes back as mojibake where every
+// character is in U+0080..U+00FF (the raw UTF-8 bytes). Detect that case and
+// re-decode the bytes as UTF-8. Values that are plain ASCII, or that contain real
+// (code-point escaped) Unicode, are returned unchanged.
+QString repairUtf8Mojibake( const QString& value )
+{
+    bool hasHighByte = false;
+    for ( const QChar c : value ) {
+        const ushort u = c.unicode();
+        if ( u > 0xFF ) {
+            return value; // contains genuine Unicode -> already correct
+        }
+        if ( u >= 0x80 ) {
+            hasHighByte = true;
+        }
+    }
+
+    if ( !hasHighByte ) {
+        return value; // pure ASCII -> nothing to repair
+    }
+
+    const QString decoded = QString::fromUtf8( value.toLatin1() );
+    if ( decoded.contains( QChar( 0xFFFD ) ) ) {
+        return value; // not a valid UTF-8 byte sequence -> leave as-is
+    }
+
+    return decoded;
+}
+} // namespace
+
 void PredefinedFiltersCollection::retrieveFromStorage( QSettings& settings )
 {
     LOG_DEBUG << "PredefinedFiltersCollection::retrieveFromStorage";
@@ -55,8 +88,8 @@ void PredefinedFiltersCollection::retrieveFromStorage( QSettings& settings )
             for ( int i = 0; i < size; ++i ) {
                 settings.setArrayIndex( i );
 
-                filters_.push_back( { settings.value( "name" ).toString(),
-                                      settings.value( "filter" ).toString(),
+                filters_.push_back( { repairUtf8Mojibake( settings.value( "name" ).toString() ),
+                                      repairUtf8Mojibake( settings.value( "filter" ).toString() ),
                                       settings.value( "regex", true ).toBool() } );
             }
             settings.endArray();
