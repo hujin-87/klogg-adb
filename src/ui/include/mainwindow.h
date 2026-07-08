@@ -240,6 +240,10 @@ class MainWindow : public QMainWindow {
     // e.g. /dev/kmsg).
     void startAdbCapture( const QString& logPath, const QStringList& captureArgs,
                           bool prepareLogcatBuffer, bool requireRoot = false );
+    // Convert the captured /dev/kmsg log (monotonic microseconds since boot) into
+    // logcat threadtime format with wall-clock timestamps, write it to
+    // kmsg.newT.txt and open it.
+    void convertKmsgToLogcat();
 
     WindowSession session_;
     QString loadingFileName;

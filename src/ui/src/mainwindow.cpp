@@ -61,6 +61,7 @@
 #include <QDir>
 #include <QDialogButtonBox>
 #include <QFile>
+#include <QTextStream>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QInputDialog>
@@ -1909,7 +1910,11 @@ bool MainWindow::loadFile( const QString& fileName, bool followFile )
             updateOpenedFilesMenu();
 
             const auto& config = Configuration::get();
-            if ( config.anyFileWatchEnabled() && ( followFile || config.followFileOnLoad() ) ) {
+            // Newly opened files follow by default so live logs tail
+            // automatically, regardless of the persisted "follow on load"
+            // preference. (followFile is accepted for API compatibility.)
+            Q_UNUSED( followFile )
+            if ( config.anyFileWatchEnabled() ) {
                 signalCrawlerToFollowFile( crawler_widget );
                 followAction->setChecked( true );
             }
@@ -2425,7 +2430,14 @@ void MainWindow::startAdbKmsg()
     // F6 toggles kernel-log capture: if a capture is already running, stop it;
     // otherwise start `adb shell cat /dev/kmsg`.
     if ( adbLogcatProcess_ != nullptr ) {
+        // If this press stops the kernel-log capture, convert the captured file
+        // to logcat timestamp format and open the result.
+        const bool wasKmsg
+            = adbLogcatFilePath_.endsWith( QStringLiteral( "klogg_adb_kmsg.txt" ) );
         stopAdbLogcat();
+        if ( wasKmsg ) {
+            convertKmsgToLogcat();
+        }
         return;
     }
 
@@ -2434,6 +2446,163 @@ void MainWindow::startAdbKmsg()
                                    << QStringLiteral( "/dev/kmsg" ),
                      false, /*requireRoot=*/true );
 }
+
+void MainWindow::convertKmsgToLogcat()
+{
+    // Convert the /dev/kmsg capture (monotonic microseconds since boot) into
+    // logcat threadtime format with wall-clock timestamps, like `dmesg -T`.
+    const QString srcPath
+        = QDir( QDir::tempPath() ).filePath( QStringLiteral( "klogg_adb_kmsg.txt" ) );
+    QFile src( srcPath );
+    QFileInfo srcInfo( srcPath );
+    if ( !srcInfo.exists() || srcInfo.size() == 0 ) {
+        return;
+    }
+
+    // Carry the current tab's search text and color labels over to the converted tab.
+    QString previousSearchText;
+    ColorLabelsManager::QuickHighlightersCollection previousColorLabels;
+    if ( auto* currentCrawler = currentCrawlerWidget() ) {
+        previousSearchText = currentCrawler->currentSearchText();
+        previousColorLabels = currentCrawler->currentColorLabels();
+    }
+
+    // Derive the device boot wall-clock time so monotonic kmsg timestamps can be
+    // rendered as real time. Requires the (same, not rebooted) device connected.
+    const QString adbExecutable = QStandardPaths::findExecutable( QStringLiteral( "adb" ) );
+    if ( adbExecutable.isEmpty() || !adbHasAuthorizedDevice( adbExecutable ) ) {
+        QMessageBox::warning(
+            this, tr( "klogg" ),
+            tr( "A connected device is required to compute wall-clock time for the kernel log." ) );
+        return;
+    }
+
+    double bootEpochSec = 0.0;
+    int tzOffsetSec = 0;
+    {
+        QProcess p;
+        p.start( adbExecutable, QStringList() << QStringLiteral( "shell" )
+                                              << QStringLiteral(
+                                                     "date +%s.%N; cat /proc/uptime; date +%z" ) );
+        if ( !p.waitForFinished( 15000 ) ) {
+            QMessageBox::critical( this, tr( "klogg" ), tr( "Timed out querying device time." ) );
+            return;
+        }
+        const auto lines = QString::fromUtf8( p.readAllStandardOutput() )
+                               .split( QLatin1Char( '\n' ), Qt::SkipEmptyParts );
+        if ( lines.size() < 3 ) {
+            QMessageBox::critical( this, tr( "klogg" ), tr( "Could not read device time." ) );
+            return;
+        }
+        const double nowEpochSec = lines[ 0 ].trimmed().toDouble();
+        const double uptimeSec = lines[ 1 ].trimmed().section( QLatin1Char( ' ' ), 0, 0 ).toDouble();
+        bootEpochSec = nowEpochSec - uptimeSec;
+
+        // Parse timezone like "+0800" / "-0530".
+        const QString tz = lines[ 2 ].trimmed();
+        if ( tz.size() == 5 && ( tz[ 0 ] == QLatin1Char( '+' ) || tz[ 0 ] == QLatin1Char( '-' ) ) ) {
+            const int hh = tz.mid( 1, 2 ).toInt();
+            const int mm = tz.mid( 3, 2 ).toInt();
+            tzOffsetSec = ( hh * 3600 + mm * 60 ) * ( tz[ 0 ] == QLatin1Char( '-' ) ? -1 : 1 );
+        }
+    }
+
+    if ( !src.open( QIODevice::ReadOnly | QIODevice::Text ) ) {
+        QMessageBox::critical( this, tr( "klogg" ),
+                               tr( "Could not open kernel log:\n%1" ).arg( srcPath ) );
+        return;
+    }
+
+    const QString dstPath = QDir( QDir::tempPath() ).filePath( QStringLiteral( "kmsg.newT.txt" ) );
+    QFile dst( dstPath );
+    if ( !dst.open( QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text ) ) {
+        QMessageBox::critical( this, tr( "klogg" ),
+                               tr( "Could not write converted log:\n%1" ).arg( dstPath ) );
+        return;
+    }
+
+    // Map syslog severity (priority % 8) to a logcat level letter.
+    const auto levelForPriority = []( int priority ) -> QChar {
+        switch ( priority & 7 ) {
+        case 0:
+        case 1:
+        case 2:
+            return QLatin1Char( 'F' );
+        case 3:
+            return QLatin1Char( 'E' );
+        case 4:
+            return QLatin1Char( 'W' );
+        case 7:
+            return QLatin1Char( 'D' );
+        default:
+            return QLatin1Char( 'I' );
+        }
+    };
+
+    QTextStream in( &src );
+    QTextStream out( &dst );
+    while ( !in.atEnd() ) {
+        const QString line = in.readLine();
+        // kmsg record: "<prio>,<seq>,<ts_us>,<flags>[,key=val...];<message>".
+        // Continuation lines (multi-line records) start with whitespace - keep raw.
+        const int semi = line.indexOf( QLatin1Char( ';' ) );
+        if ( semi < 0 || ( !line.isEmpty() && line[ 0 ].isSpace() ) ) {
+            out << line << '\n';
+            continue;
+        }
+
+        const QString header = line.left( semi );
+        const QString message = line.mid( semi + 1 );
+        const auto fields = header.split( QLatin1Char( ',' ) );
+        if ( fields.size() < 3 ) {
+            out << line << '\n';
+            continue;
+        }
+
+        const int priority = fields[ 0 ].toInt();
+        const qint64 tsUs = fields[ 2 ].toLongLong();
+
+        // Extract the caller thread id ("caller=T<num>") for the pid/tid columns.
+        int tid = 0;
+        for ( int i = 3; i < fields.size(); ++i ) {
+            const int t = fields[ i ].indexOf( QStringLiteral( "=T" ) );
+            if ( t >= 0 ) {
+                tid = fields[ i ].mid( t + 2 ).toInt();
+                break;
+            }
+        }
+
+        const double lineEpochSec = bootEpochSec + static_cast<double>( tsUs ) / 1e6;
+        const qint64 displayMs
+            = static_cast<qint64>( ( lineEpochSec + tzOffsetSec ) * 1000.0 + 0.5 );
+        const QString ts = QDateTime::fromMSecsSinceEpoch( displayMs, Qt::UTC )
+                               .toString( QStringLiteral( "MM-dd HH:mm:ss.zzz" ) );
+
+        out << ts
+            << QString( QStringLiteral( "  %1 %2 %3 kernel: " ) )
+                   .arg( tid, 5 )
+                   .arg( tid, 5 )
+                   .arg( levelForPriority( priority ) )
+            << message << '\n';
+    }
+
+    src.close();
+    dst.close();
+
+    if ( !loadFile( dstPath ) ) {
+        return;
+    }
+
+    // Auto-run the search with the carried-over keyword on the converted tab.
+    if ( auto* crawler = currentCrawlerWidget() ) {
+        crawler->setMatchCase( false );
+        crawler->startSearchWithAutoRefresh( previousSearchText );
+        if ( !previousColorLabels.empty() ) {
+            crawler->restoreColorLabels( previousColorLabels );
+        }
+    }
+}
+
 
 void MainWindow::startAdbCapture( const QString& logPath, const QStringList& captureArgs,
                                   bool prepareLogcatBuffer, bool requireRoot )
