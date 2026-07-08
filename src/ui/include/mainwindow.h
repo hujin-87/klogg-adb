@@ -235,9 +235,11 @@ class MainWindow : public QMainWindow {
     void cleanupAdbLogcatProcess();
     // Shared capture routine for the ADB actions: runs `adb <captureArgs>` into
     // logPath and opens it in a follow-mode tab. When prepareLogcatBuffer is true
-    // the device logcat ring buffer is enlarged and cleared beforehand.
+    // the device logcat ring buffer is enlarged and cleared beforehand. When
+    // requireRoot is true, adbd is restarted as root first (needed to read
+    // e.g. /dev/kmsg).
     void startAdbCapture( const QString& logPath, const QStringList& captureArgs,
-                          bool prepareLogcatBuffer );
+                          bool prepareLogcatBuffer, bool requireRoot = false );
 
     WindowSession session_;
     QString loadingFileName;

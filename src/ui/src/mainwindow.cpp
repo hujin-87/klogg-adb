@@ -80,6 +80,7 @@
 #include <QTextBrowser>
 #include <QTimer>
 #include <QToolBar>
+#include <QToolButton>
 #include <QToolTip>
 #include <QUrl>
 #include <QUrlQuery>
@@ -962,6 +963,15 @@ void MainWindow::createToolBars()
     toolBar->addAction( addToFavoritesAction );
     toolBar->addWidget( infoLine );
     toolBar->addAction( stopAction );
+
+    // Highlight the "Follow File" button in green while it is checked, to match
+    // the active-state styling of the search toolbar buttons.
+    if ( auto* followButton
+         = qobject_cast<QToolButton*>( toolBar->widgetForAction( followAction ) ) ) {
+        followButton->setStyleSheet(
+            QStringLiteral( "QToolButton:checked { background-color: #4caf50; border: 1px "
+                            "solid #388e3c; border-radius: 3px; }" ) );
+    }
 
     infoToolbarSeparators.reserve( 5 );
     infoToolbarSeparators.push_back( toolBar->addSeparator() );
@@ -2416,14 +2426,14 @@ void MainWindow::startAdbKmsg()
     // kernel log via `adb shell cat /dev/kmsg`.
     stopAdbLogcat();
 
-    startAdbCapture( QDir( QDir::tempPath() ).filePath( QStringLiteral( "klogg_adb_kmsg.log" ) ),
+    startAdbCapture( QDir( QDir::tempPath() ).filePath( QStringLiteral( "klogg_adb_kmsg.txt" ) ),
                      QStringList() << QStringLiteral( "shell" ) << QStringLiteral( "cat" )
                                    << QStringLiteral( "/dev/kmsg" ),
-                     false );
+                     false, /*requireRoot=*/true );
 }
 
 void MainWindow::startAdbCapture( const QString& logPath, const QStringList& captureArgs,
-                                  bool prepareLogcatBuffer )
+                                  bool prepareLogcatBuffer, bool requireRoot )
 {
     if ( adbLogcatProcess_ != nullptr ) {
         return;
@@ -2441,6 +2451,23 @@ void MainWindow::startAdbCapture( const QString& logPath, const QStringList& cap
             this, tr( "klogg" ),
             tr( "No authorized device found. Connect a device and check \"adb devices\"." ) );
         return;
+    }
+
+    if ( requireRoot ) {
+        // Restart adbd as root (needed to read /dev/kmsg). This drops and
+        // re-establishes the device transport, so wait for it to come back
+        // before issuing the capture command.
+        QProcess rootProc;
+        rootProc.start( adbExecutable, QStringList() << QStringLiteral( "root" ) );
+        rootProc.waitForFinished( 15000 );
+
+        QProcess waitProc;
+        waitProc.start( adbExecutable, QStringList() << QStringLiteral( "wait-for-device" ) );
+        if ( !waitProc.waitForFinished( 20000 ) ) {
+            QMessageBox::critical( this, tr( "klogg" ),
+                                   tr( "Timed out waiting for device after adb root." ) );
+            return;
+        }
     }
 
     const auto& config = Configuration::get();
