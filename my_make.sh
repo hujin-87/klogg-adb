@@ -8,7 +8,8 @@
 #
 # 用法:
 #   ./my_make.sh              # 全部: 编译 + deb + exe
-#   ./my_make.sh build        # 只编译 Linux
+#   ./my_make.sh bin          # 只编译 klogg 可执行文件 (最快)
+#   ./my_make.sh build        # 只编译 Linux (全部 target)
 #   ./my_make.sh deb          # 编译 Linux + 打 deb
 #   ./my_make.sh exe          # 只交叉编译 Windows exe/zip
 #   ./my_make.sh all          # 等同于无参数 (build + deb + exe)
@@ -37,7 +38,8 @@ usage() {
   ./my_make.sh [目标]
 
 目标:
-  build        只编译 Linux
+  bin          只编译 klogg 可执行文件 (最快, 产物 build_root/output/klogg)
+  build        只编译 Linux (全部 target)
   deb          编译 Linux + 打 .deb
   exe          只交叉编译 Windows exe/zip
   all          编译 + deb + exe (默认, 无参数时等同 all)
@@ -66,6 +68,19 @@ do_build() {
   fi
   log "[编译] cmake --build -j$JOBS"
   cmake --build "$BUILD_DIR" -j"$JOBS"
+  log "产物: $BUILD_DIR/output/klogg"
+}
+
+# ---------------------------------------------------------------------------
+# 1b) 只编译 klogg 可执行文件 (最快, 只 link 主程序)
+# ---------------------------------------------------------------------------
+do_bin() {
+  if [ ! -f "$BUILD_DIR/CMakeCache.txt" ]; then
+    log "[配置] cmake -DCMAKE_BUILD_TYPE=$BUILD_TYPE"
+    cmake -DCMAKE_BUILD_TYPE="$BUILD_TYPE" -S "$REPO" -B "$BUILD_DIR"
+  fi
+  log "[编译] cmake --build --target klogg -j$JOBS"
+  cmake --build "$BUILD_DIR" --target klogg -j"$JOBS"
   log "产物: $BUILD_DIR/output/klogg"
 }
 
@@ -117,13 +132,14 @@ open_output() {
 
 case "$TARGET" in
   -h|--help|help) usage; exit 0 ;;
+  bin)   do_bin ;;
   build) do_build ;;
   deb)   do_build; do_deb; open_output ;;
   exe)   do_exe; open_output ;;
   all)   do_build; do_deb; do_exe; open_output ;;
   *)
     echo "未知参数: $TARGET" >&2
-    echo "用法: $0 [build|deb|exe|all]" >&2
+    echo "用法: $0 [bin|build|deb|exe|all]" >&2
     exit 1
     ;;
 esac

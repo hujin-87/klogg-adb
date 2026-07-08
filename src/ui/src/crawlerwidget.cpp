@@ -341,7 +341,8 @@ void CrawlerWidget::doSetViewContext( const QString& view_context )
     const auto context = CrawlerWidgetContext{ view_context };
 
     setSizes( context.sizes() );
-    matchCaseButton_->setChecked( !context.ignoreCase() );
+    // Always restore views case-insensitive, ignoring any persisted match-case state
+    matchCaseButton_->setChecked( false );
     useRegexpButton_->setChecked( context.useRegexp() );
     inverseButton_->setChecked( context.inverseRegexp() );
     booleanButton_->setChecked( context.useBooleanCombination() );
@@ -1205,13 +1206,20 @@ void CrawlerWidget::setup()
     bottomMainLayout->setContentsMargins( 2, 2, 2, 2 );
     bottomWindow->setLayout( bottomMainLayout );
 
+    // Highlight checked toolbar buttons (match case, regex, inverse, boolean,
+    // auto-refresh, keep results) in green so their active state is obvious.
+    bottomWindow->setStyleSheet(
+        QStringLiteral( "QToolButton:checked { background-color: #4caf50; border: 1px "
+                        "solid #388e3c; border-radius: 3px; }" ) );
+
     addWidget( logMainView_ );
     addWidget( bottomWindow );
 
     // Default search checkboxes
     auto& config = Configuration::get();
     searchRefreshButton_->setChecked( config.isSearchAutoRefreshDefault() );
-    matchCaseButton_->setChecked( !config.isSearchIgnoreCaseDefault() );
+    // Always start new views case-insensitive, regardless of any stale persisted setting
+    matchCaseButton_->setChecked( false );
     useRegexpButton_->setChecked( config.mainRegexpType() == SearchRegexpType::ExtendedRegexp );
     booleanButton_->setChecked( config.isSearchLogicalCombiningDefault() );
 

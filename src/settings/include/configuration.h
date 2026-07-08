@@ -566,7 +566,7 @@ class Configuration final : public Persistable<Configuration> {
 
     // Default settings for new views
     bool searchAutoRefresh_ = false;
-    bool searchIgnoreCase_ = false;
+    bool searchIgnoreCase_ = true;
     bool searchLogicalCombining_ = false;
     QList<int> splitterSizes_;
 

@@ -1701,7 +1701,8 @@ void MainWindow::dropEvent( QDropEvent* event )
         if ( fileName.isEmpty() )
             continue;
 
-        loadFile( fileName );
+        // Files dropped in should follow (auto-refresh) by default.
+        loadFile( fileName, true );
     }
 }
 
@@ -2427,13 +2428,9 @@ void MainWindow::startAdbLogcat()
     // Save search text and color labels from the current tab so we can carry them to the new tab
     QString previousSearchText;
     ColorLabelsManager::QuickHighlightersCollection previousColorLabels;
-    bool previousMatchCase = false;
-    bool havePreviousMatchCase = false;
     if ( auto* currentCrawler = currentCrawlerWidget() ) {
         previousSearchText = currentCrawler->currentSearchText();
         previousColorLabels = currentCrawler->currentColorLabels();
-        previousMatchCase = currentCrawler->currentMatchCase();
-        havePreviousMatchCase = true;
     }
 
     // If the file is already open in a tab, close that tab first
@@ -2494,10 +2491,8 @@ void MainWindow::startAdbLogcat()
     // Set search text from previous tab and enable auto-refresh for real-time filtering
     // Also restore color labels (Ctrl+D highlights) from previous tab
     if ( auto* crawler = currentCrawlerWidget() ) {
-        // Preserve the previous tab's case-sensitivity state before searching
-        if ( havePreviousMatchCase ) {
-            crawler->setMatchCase( previousMatchCase );
-        }
+        // Always start the logcat tab case-insensitive
+        crawler->setMatchCase( false );
         crawler->startSearchWithAutoRefresh( previousSearchText );
         if ( !previousColorLabels.empty() ) {
             crawler->restoreColorLabels( previousColorLabels );
