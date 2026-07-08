@@ -706,6 +706,13 @@ void MainWindow::createActions()
     connect( adbKillCameraAction, &QAction::triggered, this,
              [ this ]( auto ) { this->killCameraAdb(); } );
 
+    adbKmsgStartAction = new QAction( tr( "Kernel Log(F6)" ), this );
+    adbKmsgStartAction->setStatusTip(
+        tr( "Stop current capture, then capture adb shell cat /dev/kmsg" ) );
+    adbKmsgStartAction->setShortcut( QKeySequence( Qt::Key_F6 ) );
+    connect( adbKmsgStartAction, &QAction::triggered, this,
+             [ this ]( auto ) { this->startAdbKmsg(); } );
+
     // Poll the camera provider PID every 3 seconds and mirror it in the F4 label.
     cameraPidTimer_ = new QTimer( this );
     cameraPidTimer_->setInterval( 3000 );
@@ -893,6 +900,7 @@ void MainWindow::createMenus()
     toolsMenu->addSeparator();
     toolsMenu->addAction( adbLogcatStartAction );
     toolsMenu->addAction( adbLogcatStopAction );
+    toolsMenu->addAction( adbKmsgStartAction );
     toolsMenu->addSeparator();
     toolsMenu->addAction( showScratchPadAction );
 
@@ -919,6 +927,7 @@ void MainWindow::createMenus()
     menuBar()->addAction( adbLogcatStopAction );
     menuBar()->addAction( adbLogcatQuickSaveAction );
     menuBar()->addAction( adbKillCameraAction );
+    menuBar()->addAction( adbKmsgStartAction );
 }
 
 void MainWindow::createToolBars()
@@ -2395,6 +2404,27 @@ void MainWindow::stopAdbLogcat()
 
 void MainWindow::startAdbLogcat()
 {
+    startAdbCapture( QDir( QDir::tempPath() ).filePath( QStringLiteral( "klogg_adb_logcat.log" ) ),
+                     QStringList() << QStringLiteral( "logcat" ) << QStringLiteral( "-v" )
+                                   << QStringLiteral( "threadtime" ),
+                     true );
+}
+
+void MainWindow::startAdbKmsg()
+{
+    // F6: first run the F2 command (stop the current capture), then capture the
+    // kernel log via `adb shell cat /dev/kmsg`.
+    stopAdbLogcat();
+
+    startAdbCapture( QDir( QDir::tempPath() ).filePath( QStringLiteral( "klogg_adb_kmsg.log" ) ),
+                     QStringList() << QStringLiteral( "shell" ) << QStringLiteral( "cat" )
+                                   << QStringLiteral( "/dev/kmsg" ),
+                     false );
+}
+
+void MainWindow::startAdbCapture( const QString& logPath, const QStringList& captureArgs,
+                                  bool prepareLogcatBuffer )
+{
     if ( adbLogcatProcess_ != nullptr ) {
         return;
     }
@@ -2421,10 +2451,6 @@ void MainWindow::startAdbLogcat()
                 "Enable \"Native file watch\" or \"Polling\" so the log view can follow new lines." ) );
     }
 
-    // Use a fixed path; user can "Quick Save" before next capture to preserve
-    const QString logPath
-        = QDir( QDir::tempPath() ).filePath( QStringLiteral( "klogg_adb_logcat.log" ) );
-
     // Save search text and color labels from the current tab so we can carry them to the new tab
     QString previousSearchText;
     ColorLabelsManager::QuickHighlightersCollection previousColorLabels;
@@ -2442,41 +2468,41 @@ void MainWindow::startAdbLogcat()
         }
     }
 
-    // Increase device log buffer size before capturing (best-effort).
-    // Some buffers (e.g. kernel) may not be resizable on all devices, which makes
-    // adb return non-zero even when the other buffers were enlarged, so we don't
-    // treat a failure here as fatal - capture can still proceed.
-    QProcess setBufferProc;
-    setBufferProc.start( adbExecutable,
-                         QStringList() << QStringLiteral( "logcat" ) << QStringLiteral( "-G" )
-                                       << QStringLiteral( "512M" ) );
-    setBufferProc.waitForFinished( 15000 );
+    if ( prepareLogcatBuffer ) {
+        // Increase device log buffer size before capturing (best-effort).
+        // Some buffers (e.g. kernel) may not be resizable on all devices, which makes
+        // adb return non-zero even when the other buffers were enlarged, so we don't
+        // treat a failure here as fatal - capture can still proceed.
+        QProcess setBufferProc;
+        setBufferProc.start( adbExecutable,
+                             QStringList() << QStringLiteral( "logcat" ) << QStringLiteral( "-G" )
+                                           << QStringLiteral( "512M" ) );
+        setBufferProc.waitForFinished( 15000 );
 
-    // Clear device log buffer
-    QProcess clearProc;
-    clearProc.start( adbExecutable,
-                     QStringList() << QStringLiteral( "logcat" ) << QStringLiteral( "-c" ) );
-    if ( !clearProc.waitForFinished( 15000 ) ) {
-        QMessageBox::critical( this, tr( "klogg" ), tr( "adb logcat -c timed out." ) );
-        return;
-    }
-    if ( clearProc.exitCode() != 0 ) {
-        const auto err = QString::fromUtf8( clearProc.readAllStandardError() );
-        QMessageBox::critical( this, tr( "klogg" ),
-                               tr( "adb logcat -c failed:\n%1" ).arg( err ) );
-        return;
+        // Clear device log buffer
+        QProcess clearProc;
+        clearProc.start( adbExecutable,
+                         QStringList() << QStringLiteral( "logcat" ) << QStringLiteral( "-c" ) );
+        if ( !clearProc.waitForFinished( 15000 ) ) {
+            QMessageBox::critical( this, tr( "klogg" ), tr( "adb logcat -c timed out." ) );
+            return;
+        }
+        if ( clearProc.exitCode() != 0 ) {
+            const auto err = QString::fromUtf8( clearProc.readAllStandardError() );
+            QMessageBox::critical( this, tr( "klogg" ),
+                                   tr( "adb logcat -c failed:\n%1" ).arg( err ) );
+            return;
+        }
     }
 
     adbLogcatFilePath_ = logPath;
 
-    // Start adb logcat process - write directly to file via kernel (no Qt event loop bottleneck)
+    // Start adb process - write directly to file via kernel (no Qt event loop bottleneck)
     adbLogcatProcess_ = new QProcess( this );
     adbLogcatProcess_->setStandardOutputFile( logPath, QIODevice::Truncate );
-    adbLogcatProcess_->start( adbExecutable,
-                              QStringList() << QStringLiteral( "logcat" ) << QStringLiteral( "-v" )
-                                            << QStringLiteral( "threadtime" ) );
+    adbLogcatProcess_->start( adbExecutable, captureArgs );
     if ( !adbLogcatProcess_->waitForStarted( 5000 ) ) {
-        QMessageBox::critical( this, tr( "klogg" ), tr( "Could not start adb logcat." ) );
+        QMessageBox::critical( this, tr( "klogg" ), tr( "Could not start adb capture." ) );
         adbLogcatProcess_->deleteLater();
         adbLogcatProcess_ = nullptr;
         return;
@@ -2491,7 +2517,7 @@ void MainWindow::startAdbLogcat()
     // Set search text from previous tab and enable auto-refresh for real-time filtering
     // Also restore color labels (Ctrl+D highlights) from previous tab
     if ( auto* crawler = currentCrawlerWidget() ) {
-        // Always start the logcat tab case-insensitive
+        // Always start the capture tab case-insensitive
         crawler->setMatchCase( false );
         crawler->startSearchWithAutoRefresh( previousSearchText );
         if ( !previousColorLabels.empty() ) {

@@ -140,6 +140,7 @@ class MainWindow : public QMainWindow {
     void selectOpenedFile();
     void generateDump();
     void startAdbLogcat();
+    void startAdbKmsg();
     void stopAdbLogcat();
     void quickSaveAdbLogcat();
     void killCameraAdb();
@@ -232,6 +233,11 @@ class MainWindow : public QMainWindow {
     void tryOpenClipboard( int tryTimes );
     void updateShortcuts();
     void cleanupAdbLogcatProcess();
+    // Shared capture routine for the ADB actions: runs `adb <captureArgs>` into
+    // logPath and opens it in a follow-mode tab. When prepareLogcatBuffer is true
+    // the device logcat ring buffer is enlarged and cleared beforehand.
+    void startAdbCapture( const QString& logPath, const QStringList& captureArgs,
+                          bool prepareLogcatBuffer );
 
     WindowSession session_;
     QString loadingFileName;
@@ -292,6 +298,7 @@ class MainWindow : public QMainWindow {
     QAction* joinTelegramAction;
     QAction* generateDumpAction;
     QAction* adbLogcatStartAction;
+    QAction* adbKmsgStartAction;
     QAction* adbLogcatStopAction;
     QAction* adbLogcatQuickSaveAction;
     QAction* adbKillCameraAction;
