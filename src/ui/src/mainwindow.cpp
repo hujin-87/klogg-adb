@@ -2422,9 +2422,12 @@ void MainWindow::startAdbLogcat()
 
 void MainWindow::startAdbKmsg()
 {
-    // F6: first run the F2 command (stop the current capture), then capture the
-    // kernel log via `adb shell cat /dev/kmsg`.
-    stopAdbLogcat();
+    // F6 toggles kernel-log capture: if a capture is already running, stop it;
+    // otherwise start `adb shell cat /dev/kmsg`.
+    if ( adbLogcatProcess_ != nullptr ) {
+        stopAdbLogcat();
+        return;
+    }
 
     startAdbCapture( QDir( QDir::tempPath() ).filePath( QStringLiteral( "klogg_adb_kmsg.txt" ) ),
                      QStringList() << QStringLiteral( "shell" ) << QStringLiteral( "cat" )
