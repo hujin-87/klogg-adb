@@ -74,6 +74,7 @@
 #include <QRegularExpression>
 
 #include <algorithm>
+#include <cstring>
 #include <QProgressDialog>
 #include <QResource>
 #include <QScreen>
@@ -2506,74 +2507,124 @@ bool MainWindow::convertKmsgFile( const QString& srcPath, const QString& dstPath
 {
     QFile src( srcPath );
     QFile dst( dstPath );
-    if ( !src.open( QIODevice::ReadOnly | QIODevice::Text )
-         || !dst.open( QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text ) ) {
+    if ( !src.open( QIODevice::ReadOnly ) || !dst.open( QIODevice::WriteOnly | QIODevice::Truncate ) ) {
         return false;
     }
 
     // Map syslog severity (priority % 8) to a logcat level letter.
-    const auto levelForPriority = []( int priority ) -> QChar {
+    const auto levelForPriority = []( int priority ) -> char {
         switch ( priority & 7 ) {
         case 0:
         case 1:
         case 2:
-            return QLatin1Char( 'F' );
+            return 'F';
         case 3:
-            return QLatin1Char( 'E' );
+            return 'E';
         case 4:
-            return QLatin1Char( 'W' );
+            return 'W';
         case 7:
-            return QLatin1Char( 'D' );
+            return 'D';
         default:
-            return QLatin1Char( 'I' );
+            return 'I';
         }
     };
 
-    QTextStream in( &src );
-    QTextStream out( &dst );
-    while ( !in.atEnd() ) {
-        const QString line = in.readLine();
+    // Right-justify a non-negative integer into width columns (space padded).
+    const auto appendPadded = []( QByteArray& b, int value, int width ) {
+        const QByteArray num = QByteArray::number( value );
+        for ( int i = num.size(); i < width; ++i ) {
+            b += ' ';
+        }
+        b += num;
+    };
+
+    // The "MM-dd HH:mm:ss" part only changes once per second, while kmsg emits
+    // many lines per second - cache it and reformat just the milliseconds.
+    qint64 cachedSecond = -1;
+    QByteArray cachedSecondPrefix;
+
+    QByteArray out;
+    out.reserve( 1 << 20 );
+
+    while ( !src.atEnd() ) {
+        const QByteArray line = src.readLine(); // keeps the trailing '\n'
+        const char* const d = line.constData();
+        const int len = line.size();
+
         // kmsg record: "<prio>,<seq>,<ts_us>,<flags>[,key=val...];<message>".
         // Continuation lines (multi-line records) start with whitespace - keep raw.
-        const int semi = line.indexOf( QLatin1Char( ';' ) );
-        if ( semi < 0 || ( !line.isEmpty() && line[ 0 ].isSpace() ) ) {
-            out << line << '\n';
+        const int semi = line.indexOf( ';' );
+        if ( semi < 0 || ( len > 0 && ( d[ 0 ] == ' ' || d[ 0 ] == '\t' ) ) ) {
+            out += line;
+            if ( len == 0 || d[ len - 1 ] != '\n' ) {
+                out += '\n';
+            }
             continue;
         }
 
-        const QString header = line.left( semi );
-        const QString message = line.mid( semi + 1 );
-        const auto fields = header.split( QLatin1Char( ',' ) );
-        if ( fields.size() < 3 ) {
-            out << line << '\n';
+        // Field boundaries before ';': prio , seq , ts_us , flags ...
+        const int c1 = line.indexOf( ',' );
+        const int c2 = c1 >= 0 ? line.indexOf( ',', c1 + 1 ) : -1;
+        if ( c1 < 0 || c2 < 0 || c2 >= semi ) {
+            out += line;
+            if ( len == 0 || d[ len - 1 ] != '\n' ) {
+                out += '\n';
+            }
             continue;
         }
+        const int c3 = line.indexOf( ',', c2 + 1 );
+        const int tsEnd = ( c3 >= 0 && c3 < semi ) ? c3 : semi;
 
-        const int priority = fields[ 0 ].toInt();
-        const qint64 tsUs = fields[ 2 ].toLongLong();
+        const int priority = line.left( c1 ).toInt();
+        const qint64 tsUs = line.mid( c2 + 1, tsEnd - ( c2 + 1 ) ).toLongLong();
 
         // Extract the caller thread id ("caller=T<num>") for the pid/tid columns.
         int tid = 0;
-        for ( int i = 3; i < fields.size(); ++i ) {
-            const int t = fields[ i ].indexOf( QStringLiteral( "=T" ) );
-            if ( t >= 0 ) {
-                tid = fields[ i ].mid( t + 2 ).toInt();
-                break;
+        const int callerAt = line.indexOf( "=T", tsEnd );
+        if ( callerAt >= 0 && callerAt < semi ) {
+            int p = callerAt + 2;
+            while ( p < semi && d[ p ] >= '0' && d[ p ] <= '9' ) {
+                tid = tid * 10 + ( d[ p ] - '0' );
+                ++p;
             }
         }
 
         const double lineEpochSec = bootEpochSec + static_cast<double>( tsUs ) / 1e6;
         const qint64 displayMs
             = static_cast<qint64>( ( lineEpochSec + tzOffsetSec ) * 1000.0 + 0.5 );
-        const QString ts = QDateTime::fromMSecsSinceEpoch( displayMs, Qt::UTC )
-                               .toString( QStringLiteral( "MM-dd HH:mm:ss.zzz" ) );
+        const qint64 second = displayMs / 1000;
+        if ( second != cachedSecond ) {
+            cachedSecond = second;
+            cachedSecondPrefix = QDateTime::fromMSecsSinceEpoch( second * 1000, Qt::UTC )
+                                     .toString( QStringLiteral( "MM-dd HH:mm:ss" ) )
+                                     .toLatin1();
+        }
+        const int ms = static_cast<int>( displayMs % 1000 );
 
-        out << ts
-            << QString( QStringLiteral( "  %1 %2 %3 kernel: " ) )
-                   .arg( tid, 5 )
-                   .arg( tid, 5 )
-                   .arg( levelForPriority( priority ) )
-            << message << '\n';
+        out += cachedSecondPrefix;
+        out += '.';
+        out += static_cast<char>( '0' + ( ms / 100 ) % 10 );
+        out += static_cast<char>( '0' + ( ms / 10 ) % 10 );
+        out += static_cast<char>( '0' + ms % 10 );
+        out += "  ";
+        appendPadded( out, tid, 5 );
+        out += ' ';
+        appendPadded( out, tid, 5 );
+        out += ' ';
+        out += levelForPriority( priority );
+        out += " kernel: ";
+        out.append( d + semi + 1, len - ( semi + 1 ) ); // message (keeps its '\n')
+        if ( len == 0 || d[ len - 1 ] != '\n' ) {
+            out += '\n';
+        }
+
+        if ( out.size() >= ( 1 << 20 ) ) {
+            dst.write( out );
+            out.clear();
+        }
+    }
+    if ( !out.isEmpty() ) {
+        dst.write( out );
     }
     return true;
 }
@@ -2648,12 +2699,11 @@ constexpr int LogcatTimestampLength = 18;
 
 // Fast check whether a raw line begins with a logcat threadtime timestamp
 // "MM-dd HH:mm:ss.zzz" (ASCII, evaluated directly on the file bytes).
-bool hasLogcatTimestamp( const QByteArray& line )
+bool hasLogcatTimestamp( const char* s, int len )
 {
-    if ( line.size() < LogcatTimestampLength ) {
+    if ( len < LogcatTimestampLength ) {
         return false;
     }
-    const char* s = line.constData();
     const auto d = [ s ]( int i ) { return s[ i ] >= '0' && s[ i ] <= '9'; };
     return d( 0 ) && d( 1 ) && s[ 2 ] == '-' && d( 3 ) && d( 4 ) && s[ 5 ] == ' ' && d( 6 )
            && d( 7 ) && s[ 8 ] == ':' && d( 9 ) && d( 10 ) && s[ 11 ] == ':' && d( 12 ) && d( 13 )
@@ -2767,11 +2817,17 @@ void MainWindow::mergeOpenFilesOffline()
     // A global stable sort then yields correct chronological order even when an
     // input file is not internally sorted (e.g. logcat printed buffer-by-buffer
     // with "--------- beginning of <buffer>" markers).
-    struct Entry {
-        QByteArray key;
-        QByteArray line;
+    //
+    // For efficiency each file is read into a single buffer and lines are stored
+    // as lightweight views (pointer + length) into those buffers - no per-line
+    // allocation or copy. The buffers must outlive the entries, so all files are
+    // read first, then indexed, sorted and written.
+    struct LineView {
+        const char* keyPtr;
+        int keyLen;
+        const char* linePtr;
+        int lineLen;
     };
-    std::vector<Entry> entries;
 
     qint64 totalBytes = 0;
     for ( const auto& f : resolved ) {
@@ -2789,40 +2845,54 @@ void MainWindow::mergeOpenFilesOffline()
         }
     };
 
+    // Read all sources fully into buffers (kept alive for the whole merge).
+    std::vector<QByteArray> buffers;
+    buffers.reserve( static_cast<size_t>( resolved.size() ) );
     qint64 bytesRead = 0;
-    qint64 sinceUpdate = 0;
     for ( const auto& f : resolved ) {
         QFile in( f );
-        if ( !in.open( QIODevice::ReadOnly ) ) {
-            continue;
+        buffers.push_back( in.open( QIODevice::ReadOnly ) ? in.readAll() : QByteArray() );
+        bytesRead += buffers.back().size();
+        progress.setValue( totalBytes > 0 ? static_cast<int>( bytesRead * 70 / totalBytes ) : 70 );
+        if ( progress.wasCanceled() ) {
+            cleanupTemps();
+            return;
         }
-        QByteArray currentKey;
-        while ( !in.atEnd() ) {
-            QByteArray line = in.readLine();
-            bytesRead += line.size();
-            sinceUpdate += line.size();
-            if ( hasLogcatTimestamp( line ) ) {
-                currentKey = line.left( LogcatTimestampLength );
-            }
-            entries.push_back( { currentKey, std::move( line ) } );
+    }
 
-            if ( sinceUpdate >= ( 1 << 20 ) ) { // ~every 1 MB
-                sinceUpdate = 0;
-                progress.setValue(
-                    totalBytes > 0 ? static_cast<int>( bytesRead * 80 / totalBytes ) : 80 );
-                if ( progress.wasCanceled() ) {
-                    cleanupTemps();
-                    return;
-                }
+    // Index every line as a view into its buffer.
+    std::vector<LineView> entries;
+    for ( const auto& buf : buffers ) {
+        const char* const bufData = buf.constData();
+        const int size = buf.size();
+        const char* keyPtr = bufData;
+        int keyLen = 0; // empty key (sorts first) until a timestamped line is seen
+        int pos = 0;
+        while ( pos < size ) {
+            const char* nl = static_cast<const char*>(
+                memchr( bufData + pos, '\n', static_cast<size_t>( size - pos ) ) );
+            const int lineLen
+                = nl ? static_cast<int>( nl - ( bufData + pos ) ) + 1 : ( size - pos );
+            if ( hasLogcatTimestamp( bufData + pos, lineLen ) ) {
+                keyPtr = bufData + pos;
+                keyLen = LogcatTimestampLength;
             }
+            entries.push_back( { keyPtr, keyLen, bufData + pos, lineLen } );
+            pos += lineLen;
         }
     }
 
     // Global stable sort by timestamp key ("" sorts first). Stable keeps
     // equal-timestamp lines and continuation lines in their original order.
-    progress.setValue( 85 );
-    std::stable_sort( entries.begin(), entries.end(),
-                      []( const Entry& a, const Entry& b ) { return a.key < b.key; } );
+    progress.setValue( 80 );
+    std::stable_sort( entries.begin(), entries.end(), []( const LineView& a, const LineView& b ) {
+        const int m = std::min( a.keyLen, b.keyLen );
+        const int c = m ? memcmp( a.keyPtr, b.keyPtr, static_cast<size_t>( m ) ) : 0;
+        if ( c != 0 ) {
+            return c < 0;
+        }
+        return a.keyLen < b.keyLen;
+    } );
     progress.setValue( 90 );
 
     QFile out( offlinePath );
@@ -2832,11 +2902,20 @@ void MainWindow::mergeOpenFilesOffline()
         cleanupTemps();
         return;
     }
+    QByteArray outBuf;
+    outBuf.reserve( 1 << 20 );
     for ( const auto& e : entries ) {
-        out.write( e.line );
-        if ( !e.line.endsWith( '\n' ) ) {
-            out.write( "\n", 1 );
+        outBuf.append( e.linePtr, e.lineLen );
+        if ( e.lineLen == 0 || e.linePtr[ e.lineLen - 1 ] != '\n' ) {
+            outBuf.append( '\n' );
         }
+        if ( outBuf.size() >= ( 1 << 20 ) ) {
+            out.write( outBuf );
+            outBuf.clear();
+        }
+    }
+    if ( !outBuf.isEmpty() ) {
+        out.write( outBuf );
     }
     out.close();
     progress.setValue( 100 );
