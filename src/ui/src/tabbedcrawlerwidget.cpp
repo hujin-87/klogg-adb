@@ -178,6 +178,17 @@ QString TabbedCrawlerWidget::tabPathAt( int index ) const
     return myTabBar_.tabData( index ).toMap()[ PathKey ].toString();
 }
 
+void TabbedCrawlerWidget::setTabColorForFile( const QString& fileName, const QColor& color )
+{
+    const auto tabsCount = count();
+    for ( int i = 0; i < tabsCount; ++i ) {
+        if ( tabPathAt( i ) == fileName ) {
+            myTabBar_.setTabTextColor( i, color );
+            return;
+        }
+    }
+}
+
 void CrawlerTabBar::mouseReleaseEvent( QMouseEvent* mouseEvent )
 {
     if ( mouseEvent->button() == Qt::RightButton ) {

@@ -2415,6 +2415,9 @@ void MainWindow::cleanupAdbLogcatProcess()
     adbLogcatProcess_->deleteLater();
     adbLogcatProcess_ = nullptr;
 
+    // Capture stopped - reset the tab color back to the default.
+    mainTabWidget_.setTabColorForFile( adbLogcatFilePath_, QColor() );
+
     if ( adbLogcatStartAction != nullptr ) {
         adbLogcatStartAction->setEnabled( true );
     }
@@ -2433,6 +2436,9 @@ void MainWindow::cleanupAdbKmsgProcess()
     adbKmsgProcess_->waitForFinished( 500 );
     adbKmsgProcess_->deleteLater();
     adbKmsgProcess_ = nullptr;
+
+    // Capture stopped - reset the tab color back to the default.
+    mainTabWidget_.setTabColorForFile( adbKmsgFilePath_, QColor() );
 }
 
 void MainWindow::stopAdbLogcat()
@@ -3074,6 +3080,9 @@ void MainWindow::startAdbCapture( const QString& logPath, const QStringList& cap
             crawler->restoreColorLabels( previousColorLabels );
         }
     }
+
+    // Colour the capturing file's tab green while the capture is running.
+    mainTabWidget_.setTabColorForFile( logPath, QColor( 0x4c, 0xaf, 0x50 ) );
 
     // Only the F1/F2 logcat capture toggles those actions; F6 stays independent.
     if ( !useKmsgSlot ) {

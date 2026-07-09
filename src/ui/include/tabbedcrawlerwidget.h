@@ -71,6 +71,10 @@ class TabbedCrawlerWidget : public QTabWidget {
 
     void removeCrawler( int index );
 
+    // Set the tab text color for the tab whose file path matches fileName.
+    // Pass an invalid QColor() to reset to the default text color.
+    void setTabColorForFile( const QString& fileName, const QColor& color );
+
   protected:
     void keyPressEvent( QKeyEvent* event ) override;
     void mouseReleaseEvent( QMouseEvent* event ) override;
