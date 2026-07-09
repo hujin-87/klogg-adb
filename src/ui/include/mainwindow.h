@@ -234,13 +234,18 @@ class MainWindow : public QMainWindow {
     void tryOpenClipboard( int tryTimes );
     void updateShortcuts();
     void cleanupAdbLogcatProcess();
+    // Stop and clean up the F6 kernel-log capture. Independent of the F1/F2
+    // logcat capture - does not touch the logcat process or its actions.
+    void cleanupAdbKmsgProcess();
     // Shared capture routine for the ADB actions: runs `adb <captureArgs>` into
     // logPath and opens it in a follow-mode tab. When prepareLogcatBuffer is true
     // the device logcat ring buffer is enlarged and cleared beforehand. When
     // requireRoot is true, adbd is restarted as root first (needed to read
-    // e.g. /dev/kmsg).
+    // e.g. /dev/kmsg). When useKmsgSlot is true the capture uses the separate
+    // F6 kernel-log process slot and does not touch the F1/F2 actions.
     void startAdbCapture( const QString& logPath, const QStringList& captureArgs,
-                          bool prepareLogcatBuffer, bool requireRoot = false );
+                          bool prepareLogcatBuffer, bool requireRoot = false,
+                          bool useKmsgSlot = false );
     // Convert the captured /dev/kmsg log (monotonic microseconds since boot) into
     // logcat threadtime format with wall-clock timestamps, write it to
     // kmsg.newT.txt and open it.
@@ -356,6 +361,8 @@ class MainWindow : public QMainWindow {
 
     QProcess* adbLogcatProcess_ = nullptr;
     QString adbLogcatFilePath_;
+    QProcess* adbKmsgProcess_ = nullptr;
+    QString adbKmsgFilePath_;
 
     QProcess* cameraPidProcess_ = nullptr;
     QTimer* cameraPidTimer_ = nullptr;

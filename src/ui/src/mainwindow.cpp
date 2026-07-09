@@ -1673,6 +1673,7 @@ void MainWindow::closeEvent( QCloseEvent* event )
     }
     else {
         cleanupAdbLogcatProcess();
+        cleanupAdbKmsgProcess();
 
         const auto saveSettings = session_.close();
         if ( saveSettings ) {
@@ -2421,6 +2422,18 @@ void MainWindow::cleanupAdbLogcatProcess()
     }
 }
 
+void MainWindow::cleanupAdbKmsgProcess()
+{
+    if ( adbKmsgProcess_ == nullptr ) {
+        return;
+    }
+
+    adbKmsgProcess_->kill();
+    adbKmsgProcess_->waitForFinished( 500 );
+    adbKmsgProcess_->deleteLater();
+    adbKmsgProcess_ = nullptr;
+}
+
 void MainWindow::stopAdbLogcat()
 {
     if ( adbLogcatProcess_ == nullptr ) {
@@ -2440,24 +2453,18 @@ void MainWindow::startAdbLogcat()
 
 void MainWindow::startAdbKmsg()
 {
-    // F6 toggles kernel-log capture: if a capture is already running, stop it;
-    // otherwise start `adb shell cat /dev/kmsg`.
-    if ( adbLogcatProcess_ != nullptr ) {
-        // If this press stops the kernel-log capture, convert the captured file
-        // to logcat timestamp format and open the result.
-        const bool wasKmsg
-            = adbLogcatFilePath_.endsWith( QStringLiteral( "klogg_adb_kmsg.log" ) );
-        stopAdbLogcat();
-        if ( wasKmsg ) {
-            convertKmsgToLogcat();
-        }
+    // F6 toggles kernel-log capture, independent of the F1/F2 logcat capture.
+    if ( adbKmsgProcess_ != nullptr ) {
+        // Stopping: clean up the kernel-log capture and convert it to logcat time.
+        cleanupAdbKmsgProcess();
+        convertKmsgToLogcat();
         return;
     }
 
     startAdbCapture( QDir( QDir::tempPath() ).filePath( QStringLiteral( "klogg_adb_kmsg.log" ) ),
                      QStringList() << QStringLiteral( "shell" ) << QStringLiteral( "cat" )
                                    << QStringLiteral( "/dev/kmsg" ),
-                     false, /*requireRoot=*/true );
+                     false, /*requireRoot=*/true, /*useKmsgSlot=*/true );
 }
 
 bool MainWindow::queryDeviceBootTime( double& bootEpochSec, int& tzOffsetSec )
@@ -2861,9 +2868,13 @@ void MainWindow::mergeOpenFilesOffline()
 
 
 void MainWindow::startAdbCapture( const QString& logPath, const QStringList& captureArgs,
-                                  bool prepareLogcatBuffer, bool requireRoot )
+                                  bool prepareLogcatBuffer, bool requireRoot, bool useKmsgSlot )
 {
-    if ( adbLogcatProcess_ != nullptr ) {
+    // Use the separate F6 kernel-log slot or the F1/F2 logcat slot.
+    QProcess*& proc = useKmsgSlot ? adbKmsgProcess_ : adbLogcatProcess_;
+    QString& filePathRef = useKmsgSlot ? adbKmsgFilePath_ : adbLogcatFilePath_;
+
+    if ( proc != nullptr ) {
         return;
     }
 
@@ -2950,22 +2961,27 @@ void MainWindow::startAdbCapture( const QString& logPath, const QStringList& cap
         }
     }
 
-    adbLogcatFilePath_ = logPath;
+    filePathRef = logPath;
 
     // Start adb process - write directly to file via kernel (no Qt event loop bottleneck)
-    adbLogcatProcess_ = new QProcess( this );
-    adbLogcatProcess_->setStandardOutputFile( logPath, QIODevice::Truncate );
-    adbLogcatProcess_->start( adbExecutable, captureArgs );
-    if ( !adbLogcatProcess_->waitForStarted( 5000 ) ) {
+    proc = new QProcess( this );
+    proc->setStandardOutputFile( logPath, QIODevice::Truncate );
+    proc->start( adbExecutable, captureArgs );
+    if ( !proc->waitForStarted( 5000 ) ) {
         QMessageBox::critical( this, tr( "klogg" ), tr( "Could not start adb capture." ) );
-        adbLogcatProcess_->deleteLater();
-        adbLogcatProcess_ = nullptr;
+        proc->deleteLater();
+        proc = nullptr;
         return;
     }
 
     // Open the file in klogg with follow mode
     if ( !loadFile( logPath, true ) ) {
-        cleanupAdbLogcatProcess();
+        if ( useKmsgSlot ) {
+            cleanupAdbKmsgProcess();
+        }
+        else {
+            cleanupAdbLogcatProcess();
+        }
         return;
     }
 
@@ -2980,8 +2996,11 @@ void MainWindow::startAdbCapture( const QString& logPath, const QStringList& cap
         }
     }
 
-    adbLogcatStartAction->setEnabled( false );
-    adbLogcatStopAction->setEnabled( true );
+    // Only the F1/F2 logcat capture toggles those actions; F6 stays independent.
+    if ( !useKmsgSlot ) {
+        adbLogcatStartAction->setEnabled( false );
+        adbLogcatStopAction->setEnabled( true );
+    }
 }
 
 void MainWindow::quickSaveAdbLogcat()
