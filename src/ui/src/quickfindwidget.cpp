@@ -88,7 +88,10 @@ QuickFindWidget::QuickFindWidget( QWidget* parent )
 
     nextButton_
         = setupToolButton( QLatin1String( "Next" ), QLatin1String( ":/images/arrowdown.png" ) );
-    nextButton_->setShortcut( QKeySequence::FindNext );
+    // Note: no F3 (QKeySequence::FindNext) shortcut here - F3 is reserved for the
+    // ADB "Quick Save" action; an F3 binding here makes the shortcut ambiguous and
+    // stops Quick Save's F3 from firing (notably on Windows). Enter in the box and
+    // the main view's N / Ctrl+G still repeat the search.
     layout->addWidget( nextButton_ );
 
     notificationText_ = new QLabel( "" );

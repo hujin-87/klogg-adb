@@ -58,6 +58,7 @@
 
 #include <QClipboard>
 #include <QCloseEvent>
+#include <QComboBox>
 #include <QDir>
 #include <QDialogButtonBox>
 #include <QFile>
@@ -70,6 +71,9 @@
 #include <QMessageBox>
 #include <QMimeData>
 #include <QProcess>
+#include <QRegularExpression>
+
+#include <algorithm>
 #include <QProgressDialog>
 #include <QResource>
 #include <QScreen>
@@ -715,6 +719,13 @@ void MainWindow::createActions()
     connect( adbKmsgStartAction, &QAction::triggered, this,
              [ this ]( auto ) { this->startAdbKmsg(); } );
 
+    adbOfflineMergeAction = new QAction( tr( "Merge Offline(F9)" ), this );
+    adbOfflineMergeAction->setStatusTip(
+        tr( "Merge all open files into offline.txt ordered by timestamp" ) );
+    adbOfflineMergeAction->setShortcut( QKeySequence( Qt::Key_F9 ) );
+    connect( adbOfflineMergeAction, &QAction::triggered, this,
+             [ this ]( auto ) { this->mergeOpenFilesOffline(); } );
+
     // Poll the camera provider PID every 3 seconds and mirror it in the F4 label.
     cameraPidTimer_ = new QTimer( this );
     cameraPidTimer_->setInterval( 3000 );
@@ -903,6 +914,7 @@ void MainWindow::createMenus()
     toolsMenu->addAction( adbLogcatStartAction );
     toolsMenu->addAction( adbLogcatStopAction );
     toolsMenu->addAction( adbKmsgStartAction );
+    toolsMenu->addAction( adbOfflineMergeAction );
     toolsMenu->addSeparator();
     toolsMenu->addAction( showScratchPadAction );
 
@@ -930,6 +942,7 @@ void MainWindow::createMenus()
     menuBar()->addAction( adbLogcatQuickSaveAction );
     menuBar()->addAction( adbKillCameraAction );
     menuBar()->addAction( adbKmsgStartAction );
+    menuBar()->addAction( adbOfflineMergeAction );
 }
 
 void MainWindow::createToolBars()
@@ -2433,7 +2446,7 @@ void MainWindow::startAdbKmsg()
         // If this press stops the kernel-log capture, convert the captured file
         // to logcat timestamp format and open the result.
         const bool wasKmsg
-            = adbLogcatFilePath_.endsWith( QStringLiteral( "klogg_adb_kmsg.txt" ) );
+            = adbLogcatFilePath_.endsWith( QStringLiteral( "klogg_adb_kmsg.log" ) );
         stopAdbLogcat();
         if ( wasKmsg ) {
             convertKmsgToLogcat();
@@ -2441,84 +2454,54 @@ void MainWindow::startAdbKmsg()
         return;
     }
 
-    startAdbCapture( QDir( QDir::tempPath() ).filePath( QStringLiteral( "klogg_adb_kmsg.txt" ) ),
+    startAdbCapture( QDir( QDir::tempPath() ).filePath( QStringLiteral( "klogg_adb_kmsg.log" ) ),
                      QStringList() << QStringLiteral( "shell" ) << QStringLiteral( "cat" )
                                    << QStringLiteral( "/dev/kmsg" ),
                      false, /*requireRoot=*/true );
 }
 
-void MainWindow::convertKmsgToLogcat()
+bool MainWindow::queryDeviceBootTime( double& bootEpochSec, int& tzOffsetSec )
 {
-    // Convert the /dev/kmsg capture (monotonic microseconds since boot) into
-    // logcat threadtime format with wall-clock timestamps, like `dmesg -T`.
-    const QString srcPath
-        = QDir( QDir::tempPath() ).filePath( QStringLiteral( "klogg_adb_kmsg.txt" ) );
-    QFile src( srcPath );
-    QFileInfo srcInfo( srcPath );
-    if ( !srcInfo.exists() || srcInfo.size() == 0 ) {
-        return;
-    }
-
-    // Carry the current tab's search text and color labels over to the converted tab.
-    QString previousSearchText;
-    ColorLabelsManager::QuickHighlightersCollection previousColorLabels;
-    if ( auto* currentCrawler = currentCrawlerWidget() ) {
-        previousSearchText = currentCrawler->currentSearchText();
-        previousColorLabels = currentCrawler->currentColorLabels();
-    }
-
-    // Derive the device boot wall-clock time so monotonic kmsg timestamps can be
-    // rendered as real time. Requires the (same, not rebooted) device connected.
     const QString adbExecutable = QStandardPaths::findExecutable( QStringLiteral( "adb" ) );
     if ( adbExecutable.isEmpty() || !adbHasAuthorizedDevice( adbExecutable ) ) {
-        QMessageBox::warning(
-            this, tr( "klogg" ),
-            tr( "A connected device is required to compute wall-clock time for the kernel log." ) );
-        return;
+        return false;
     }
 
-    double bootEpochSec = 0.0;
-    int tzOffsetSec = 0;
-    {
-        QProcess p;
-        p.start( adbExecutable, QStringList() << QStringLiteral( "shell" )
-                                              << QStringLiteral(
-                                                     "date +%s.%N; cat /proc/uptime; date +%z" ) );
-        if ( !p.waitForFinished( 15000 ) ) {
-            QMessageBox::critical( this, tr( "klogg" ), tr( "Timed out querying device time." ) );
-            return;
-        }
-        const auto lines = QString::fromUtf8( p.readAllStandardOutput() )
-                               .split( QLatin1Char( '\n' ), Qt::SkipEmptyParts );
-        if ( lines.size() < 3 ) {
-            QMessageBox::critical( this, tr( "klogg" ), tr( "Could not read device time." ) );
-            return;
-        }
-        const double nowEpochSec = lines[ 0 ].trimmed().toDouble();
-        const double uptimeSec = lines[ 1 ].trimmed().section( QLatin1Char( ' ' ), 0, 0 ).toDouble();
-        bootEpochSec = nowEpochSec - uptimeSec;
-
-        // Parse timezone like "+0800" / "-0530".
-        const QString tz = lines[ 2 ].trimmed();
-        if ( tz.size() == 5 && ( tz[ 0 ] == QLatin1Char( '+' ) || tz[ 0 ] == QLatin1Char( '-' ) ) ) {
-            const int hh = tz.mid( 1, 2 ).toInt();
-            const int mm = tz.mid( 3, 2 ).toInt();
-            tzOffsetSec = ( hh * 3600 + mm * 60 ) * ( tz[ 0 ] == QLatin1Char( '-' ) ? -1 : 1 );
-        }
+    QProcess p;
+    p.start( adbExecutable, QStringList()
+                                << QStringLiteral( "shell" )
+                                << QStringLiteral( "date +%s.%N; cat /proc/uptime; date +%z" ) );
+    if ( !p.waitForFinished( 15000 ) ) {
+        return false;
     }
-
-    if ( !src.open( QIODevice::ReadOnly | QIODevice::Text ) ) {
-        QMessageBox::critical( this, tr( "klogg" ),
-                               tr( "Could not open kernel log:\n%1" ).arg( srcPath ) );
-        return;
+    const auto lines = QString::fromUtf8( p.readAllStandardOutput() )
+                           .split( QLatin1Char( '\n' ), Qt::SkipEmptyParts );
+    if ( lines.size() < 3 ) {
+        return false;
     }
+    const double nowEpochSec = lines[ 0 ].trimmed().toDouble();
+    const double uptimeSec = lines[ 1 ].trimmed().section( QLatin1Char( ' ' ), 0, 0 ).toDouble();
+    bootEpochSec = nowEpochSec - uptimeSec;
 
-    const QString dstPath = QDir( QDir::tempPath() ).filePath( QStringLiteral( "kmsg.newT.txt" ) );
+    // Parse timezone like "+0800" / "-0530".
+    tzOffsetSec = 0;
+    const QString tz = lines[ 2 ].trimmed();
+    if ( tz.size() == 5 && ( tz[ 0 ] == QLatin1Char( '+' ) || tz[ 0 ] == QLatin1Char( '-' ) ) ) {
+        const int hh = tz.mid( 1, 2 ).toInt();
+        const int mm = tz.mid( 3, 2 ).toInt();
+        tzOffsetSec = ( hh * 3600 + mm * 60 ) * ( tz[ 0 ] == QLatin1Char( '-' ) ? -1 : 1 );
+    }
+    return true;
+}
+
+bool MainWindow::convertKmsgFile( const QString& srcPath, const QString& dstPath,
+                                  double bootEpochSec, int tzOffsetSec )
+{
+    QFile src( srcPath );
     QFile dst( dstPath );
-    if ( !dst.open( QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text ) ) {
-        QMessageBox::critical( this, tr( "klogg" ),
-                               tr( "Could not write converted log:\n%1" ).arg( dstPath ) );
-        return;
+    if ( !src.open( QIODevice::ReadOnly | QIODevice::Text )
+         || !dst.open( QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text ) ) {
+        return false;
     }
 
     // Map syslog severity (priority % 8) to a logcat level letter.
@@ -2585,15 +2568,288 @@ void MainWindow::convertKmsgToLogcat()
                    .arg( levelForPriority( priority ) )
             << message << '\n';
     }
+    return true;
+}
 
-    src.close();
-    dst.close();
+void MainWindow::convertKmsgToLogcat()
+{
+    // Convert the /dev/kmsg capture (monotonic microseconds since boot) into
+    // logcat threadtime format with wall-clock timestamps, like `dmesg -T`.
+    const QString srcPath
+        = QDir( QDir::tempPath() ).filePath( QStringLiteral( "klogg_adb_kmsg.log" ) );
+    QFileInfo srcInfo( srcPath );
+    if ( !srcInfo.exists() || srcInfo.size() == 0 ) {
+        return;
+    }
+
+    // Carry the current tab's search text and color labels over to the converted tab.
+    QString previousSearchText;
+    ColorLabelsManager::QuickHighlightersCollection previousColorLabels;
+    if ( auto* currentCrawler = currentCrawlerWidget() ) {
+        previousSearchText = currentCrawler->currentSearchText();
+        previousColorLabels = currentCrawler->currentColorLabels();
+    }
+
+    // Derive the device boot wall-clock time. Requires the (same, not rebooted) device.
+    double bootEpochSec = 0.0;
+    int tzOffsetSec = 0;
+    if ( !queryDeviceBootTime( bootEpochSec, tzOffsetSec ) ) {
+        QMessageBox::warning(
+            this, tr( "klogg" ),
+            tr( "A connected device is required to compute wall-clock time for the kernel log." ) );
+        return;
+    }
+
+    const QString dstPath = QDir( QDir::tempPath() ).filePath( QStringLiteral( "kmsg.newT.txt" ) );
+    if ( !convertKmsgFile( srcPath, dstPath, bootEpochSec, tzOffsetSec ) ) {
+        QMessageBox::critical( this, tr( "klogg" ),
+                               tr( "Could not convert the kernel log." ) );
+        return;
+    }
 
     if ( !loadFile( dstPath ) ) {
         return;
     }
 
     // Auto-run the search with the carried-over keyword on the converted tab.
+    if ( auto* crawler = currentCrawlerWidget() ) {
+        crawler->setMatchCase( false );
+        crawler->startSearchWithAutoRefresh( previousSearchText );
+        if ( !previousColorLabels.empty() ) {
+            crawler->restoreColorLabels( previousColorLabels );
+        }
+    }
+}
+
+namespace {
+// Logcat threadtime line prefix: "MM-dd HH:mm:ss.zzz" (18 chars). Sorting by this
+// text is chronological within a year (lexicographic == time order).
+const QRegularExpression& logcatTimestampRegex()
+{
+    static const QRegularExpression re(
+        QStringLiteral( "^\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}\\.\\d{3}" ) );
+    return re;
+}
+// Raw kmsg line prefix: "<prio>,<seq>,<ts_us>,".
+const QRegularExpression& kmsgLineRegex()
+{
+    static const QRegularExpression re( QStringLiteral( "^\\d+,\\d+,\\d+," ) );
+    return re;
+}
+
+constexpr int LogcatTimestampLength = 18;
+
+// Fast check whether a raw line begins with a logcat threadtime timestamp
+// "MM-dd HH:mm:ss.zzz" (ASCII, evaluated directly on the file bytes).
+bool hasLogcatTimestamp( const QByteArray& line )
+{
+    if ( line.size() < LogcatTimestampLength ) {
+        return false;
+    }
+    const char* s = line.constData();
+    const auto d = [ s ]( int i ) { return s[ i ] >= '0' && s[ i ] <= '9'; };
+    return d( 0 ) && d( 1 ) && s[ 2 ] == '-' && d( 3 ) && d( 4 ) && s[ 5 ] == ' ' && d( 6 )
+           && d( 7 ) && s[ 8 ] == ':' && d( 9 ) && d( 10 ) && s[ 11 ] == ':' && d( 12 ) && d( 13 )
+           && s[ 14 ] == '.' && d( 15 ) && d( 16 ) && d( 17 );
+}
+} // namespace
+
+void MainWindow::mergeOpenFilesOffline()
+{
+    const QString tempDir = QDir::tempPath();
+    const QString offlinePath = QDir( tempDir ).filePath( QStringLiteral( "offline.txt" ) );
+
+    const auto openedFiles = session_.openedFiles();
+
+    // Carry the current tab's search text and color labels over to the merged tab.
+    QString previousSearchText;
+    ColorLabelsManager::QuickHighlightersCollection previousColorLabels;
+    if ( auto* currentCrawler = currentCrawlerWidget() ) {
+        previousSearchText = currentCrawler->currentSearchText();
+        previousColorLabels = currentCrawler->currentColorLabels();
+    }
+
+    const auto baseName = []( const QString& p ) { return QFileInfo( p ).fileName(); };
+
+    // If the converted kernel log is present, skip the raw kmsg capture.
+    bool hasConvertedKmsg = false;
+    for ( const auto& f : openedFiles ) {
+        if ( baseName( f ) == QLatin1String( "kmsg.newT.txt" ) ) {
+            hasConvertedKmsg = true;
+            break;
+        }
+    }
+
+    QStringList sources;
+    for ( const auto& f : openedFiles ) {
+        const QString name = baseName( f );
+        if ( name == QLatin1String( "offline.txt" ) ) {
+            continue; // never merge the target into itself
+        }
+        if ( hasConvertedKmsg && name == QLatin1String( "klogg_adb_kmsg.log" ) ) {
+            continue; // superseded by kmsg.newT.txt
+        }
+        sources << f;
+    }
+
+    if ( sources.isEmpty() ) {
+        QMessageBox::information( this, tr( "klogg" ), tr( "No open files to merge." ) );
+        return;
+    }
+
+    // Resolve each source to a logcat-timestamped file, converting raw kmsg captures.
+    bool haveBootTime = false;
+    double bootEpochSec = 0.0;
+    int tzOffsetSec = 0;
+    QStringList resolved;
+    QStringList tempFiles;
+    for ( const auto& f : sources ) {
+        // Sample the first lines to detect the format.
+        bool isLogcat = false;
+        bool isKmsg = false;
+        QFile probe( f );
+        if ( probe.open( QIODevice::ReadOnly | QIODevice::Text ) ) {
+            QTextStream ps( &probe );
+            for ( int i = 0; i < 50 && !ps.atEnd(); ++i ) {
+                const QString line = ps.readLine();
+                if ( line.isEmpty() ) {
+                    continue;
+                }
+                if ( logcatTimestampRegex().match( line ).hasMatch() ) {
+                    isLogcat = true;
+                    break;
+                }
+                if ( kmsgLineRegex().match( line ).hasMatch() ) {
+                    isKmsg = true;
+                    break;
+                }
+            }
+        }
+
+        if ( isKmsg && !isLogcat ) {
+            if ( !haveBootTime ) {
+                if ( !queryDeviceBootTime( bootEpochSec, tzOffsetSec ) ) {
+                    QMessageBox::warning(
+                        this, tr( "klogg" ),
+                        tr( "A connected device is required to convert the kernel log \"%1\"; "
+                            "skipping it." )
+                            .arg( baseName( f ) ) );
+                    continue;
+                }
+                haveBootTime = true;
+            }
+            const QString tmp = QDir( tempDir ).filePath( baseName( f )
+                                                          + QStringLiteral( ".logcatT.tmp" ) );
+            if ( convertKmsgFile( f, tmp, bootEpochSec, tzOffsetSec ) ) {
+                resolved << tmp;
+                tempFiles << tmp;
+            }
+        }
+        else {
+            resolved << f; // logcat format (or unknown - included as-is)
+        }
+    }
+
+    if ( resolved.isEmpty() ) {
+        QMessageBox::information( this, tr( "klogg" ), tr( "Nothing to merge." ) );
+        return;
+    }
+
+    // Read every line from all resolved sources, tagging each with the timestamp
+    // of its record: lines without a timestamp inherit the previous line's key.
+    // A global stable sort then yields correct chronological order even when an
+    // input file is not internally sorted (e.g. logcat printed buffer-by-buffer
+    // with "--------- beginning of <buffer>" markers).
+    struct Entry {
+        QByteArray key;
+        QByteArray line;
+    };
+    std::vector<Entry> entries;
+
+    qint64 totalBytes = 0;
+    for ( const auto& f : resolved ) {
+        totalBytes += QFileInfo( f ).size();
+    }
+
+    QProgressDialog progress( tr( "Merging open files into offline.txt..." ), tr( "Cancel" ), 0,
+                              100, this );
+    progress.setWindowModality( Qt::WindowModal );
+    progress.setMinimumDuration( 500 );
+
+    const auto cleanupTemps = [ &tempFiles ]() {
+        for ( const auto& tmp : tempFiles ) {
+            QFile::remove( tmp );
+        }
+    };
+
+    qint64 bytesRead = 0;
+    qint64 sinceUpdate = 0;
+    for ( const auto& f : resolved ) {
+        QFile in( f );
+        if ( !in.open( QIODevice::ReadOnly ) ) {
+            continue;
+        }
+        QByteArray currentKey;
+        while ( !in.atEnd() ) {
+            QByteArray line = in.readLine();
+            bytesRead += line.size();
+            sinceUpdate += line.size();
+            if ( hasLogcatTimestamp( line ) ) {
+                currentKey = line.left( LogcatTimestampLength );
+            }
+            entries.push_back( { currentKey, std::move( line ) } );
+
+            if ( sinceUpdate >= ( 1 << 20 ) ) { // ~every 1 MB
+                sinceUpdate = 0;
+                progress.setValue(
+                    totalBytes > 0 ? static_cast<int>( bytesRead * 80 / totalBytes ) : 80 );
+                if ( progress.wasCanceled() ) {
+                    cleanupTemps();
+                    return;
+                }
+            }
+        }
+    }
+
+    // Global stable sort by timestamp key ("" sorts first). Stable keeps
+    // equal-timestamp lines and continuation lines in their original order.
+    progress.setValue( 85 );
+    std::stable_sort( entries.begin(), entries.end(),
+                      []( const Entry& a, const Entry& b ) { return a.key < b.key; } );
+    progress.setValue( 90 );
+
+    QFile out( offlinePath );
+    if ( !out.open( QIODevice::WriteOnly | QIODevice::Truncate ) ) {
+        QMessageBox::critical( this, tr( "klogg" ),
+                               tr( "Could not write merged log:\n%1" ).arg( offlinePath ) );
+        cleanupTemps();
+        return;
+    }
+    for ( const auto& e : entries ) {
+        out.write( e.line );
+        if ( !e.line.endsWith( '\n' ) ) {
+            out.write( "\n", 1 );
+        }
+    }
+    out.close();
+    progress.setValue( 100 );
+
+    cleanupTemps();
+
+    // If offline.txt is already open, close that tab so the fresh content loads.
+    if ( auto* existingView
+         = static_cast<CrawlerWidget*>( session_.getViewIfOpen( offlinePath ) ) ) {
+        const int tabIndex = mainTabWidget_.indexOf( existingView );
+        if ( tabIndex >= 0 ) {
+            closeTab( tabIndex, ActionInitiator::App );
+        }
+    }
+
+    if ( !loadFile( offlinePath ) ) {
+        return;
+    }
+
+    // Auto-run the search with the carried-over keyword on the merged tab.
     if ( auto* crawler = currentCrawlerWidget() ) {
         crawler->setMatchCase( false );
         crawler->startSearchWithAutoRefresh( previousSearchText );
@@ -2744,6 +3000,12 @@ void MainWindow::quickSaveAdbLogcat()
 #if defined( Q_OS_LINUX )
     // On Linux save into a dedicated /tmp/0_klogg/ directory.
     QDir saveDir( QStringLiteral( "/tmp/0_klogg" ) );
+    if ( !saveDir.exists() ) {
+        saveDir.mkpath( QStringLiteral( "." ) );
+    }
+#elif defined( Q_OS_WIN )
+    // On Windows save into D:\0_klogg (created if it does not exist).
+    QDir saveDir( QStringLiteral( "D:/0_klogg" ) );
     if ( !saveDir.exists() ) {
         saveDir.mkpath( QStringLiteral( "." ) );
     }

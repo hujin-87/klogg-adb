@@ -141,6 +141,7 @@ class MainWindow : public QMainWindow {
     void generateDump();
     void startAdbLogcat();
     void startAdbKmsg();
+    void mergeOpenFilesOffline();
     void stopAdbLogcat();
     void quickSaveAdbLogcat();
     void killCameraAdb();
@@ -244,6 +245,13 @@ class MainWindow : public QMainWindow {
     // logcat threadtime format with wall-clock timestamps, write it to
     // kmsg.newT.txt and open it.
     void convertKmsgToLogcat();
+    // Query the connected device for its boot wall-clock time (epoch seconds) and
+    // timezone offset (seconds). Returns false if no device / query failed.
+    bool queryDeviceBootTime( double& bootEpochSec, int& tzOffsetSec );
+    // Convert a raw /dev/kmsg capture at srcPath into logcat threadtime format at
+    // dstPath using the given boot time. Returns false on I/O error.
+    bool convertKmsgFile( const QString& srcPath, const QString& dstPath, double bootEpochSec,
+                          int tzOffsetSec );
 
     WindowSession session_;
     QString loadingFileName;
@@ -305,6 +313,7 @@ class MainWindow : public QMainWindow {
     QAction* generateDumpAction;
     QAction* adbLogcatStartAction;
     QAction* adbKmsgStartAction;
+    QAction* adbOfflineMergeAction;
     QAction* adbLogcatStopAction;
     QAction* adbLogcatQuickSaveAction;
     QAction* adbKillCameraAction;
