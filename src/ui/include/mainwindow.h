@@ -253,6 +253,15 @@ class MainWindow : public QMainWindow {
     // Query the connected device for its boot wall-clock time (epoch seconds) and
     // timezone offset (seconds). Returns false if no device / query failed.
     bool queryDeviceBootTime( double& bootEpochSec, int& tzOffsetSec );
+    // Ensure a target device is selected for the ADB commands. If several devices
+    // are authorized and none is currently selected (or the selection is gone),
+    // the user is prompted to pick one; the choice is remembered in adbSerial_ and
+    // passed as `-s <serial>` to subsequent adb calls. Returns false when no device
+    // is available or the user cancels the selection.
+    bool ensureAdbDevice( const QString& adbExecutable );
+    // Build an adb argument list, prepending `-s <serial>` when a target device
+    // has been selected so the command is directed at that specific device.
+    QStringList adbArgs( const QStringList& subCommand ) const;
     // Convert a raw /dev/kmsg capture at srcPath into logcat threadtime format at
     // dstPath using the given boot time. Returns false on I/O error.
     bool convertKmsgFile( const QString& srcPath, const QString& dstPath, double bootEpochSec,
@@ -363,6 +372,9 @@ class MainWindow : public QMainWindow {
     QString adbLogcatFilePath_;
     QProcess* adbKmsgProcess_ = nullptr;
     QString adbKmsgFilePath_;
+    // Serial of the device chosen when multiple are attached; empty means "use
+    // the single/default device" (no `-s` flag). See ensureAdbDevice/adbArgs.
+    QString adbSerial_;
 
     QProcess* cameraPidProcess_ = nullptr;
     QTimer* cameraPidTimer_ = nullptr;

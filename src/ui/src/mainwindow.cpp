@@ -127,26 +127,31 @@ void signalCrawlerToFollowFile( CrawlerWidget* crawler_widget )
 
 static constexpr auto ClipboardMaxTry = 5;
 
-bool adbHasAuthorizedDevice( const QString& adbExecutable )
+// Return the serial numbers of every authorized ("device" state) target listed
+// by `adb devices`. Offline/unauthorized/no-permission entries are skipped.
+QStringList adbAuthorizedDevices( const QString& adbExecutable )
 {
     QProcess process;
     process.start( adbExecutable, QStringList() << QStringLiteral( "devices" ) );
     if ( !process.waitForFinished( 8000 ) ) {
-        return false;
+        return {};
     }
     if ( process.exitCode() != 0 ) {
-        return false;
+        return {};
     }
+    QStringList serials;
     const auto out = QString::fromUtf8( process.readAllStandardOutput() );
     const auto lines = out.split( QLatin1Char( '\n' ) );
+    // Skip the "List of devices attached" header line.
     for ( int i = 1; i < lines.size(); ++i ) {
         const QString line = lines.at( i ).trimmed();
-        if ( line.endsWith( QLatin1String( "\tdevice" ) )
-             || line.endsWith( QLatin1String( " device" ) ) ) {
-            return true;
+        // Each entry is "<serial>\t<state>"; only "device" is usable.
+        const auto fields = line.split( QLatin1Char( '\t' ), Qt::SkipEmptyParts );
+        if ( fields.size() >= 2 && fields.at( 1 ).trimmed() == QLatin1String( "device" ) ) {
+            serials << fields.at( 0 ).trimmed();
         }
     }
-    return false;
+    return serials;
 }
 
 // Compile date derived from the __DATE__ macro ("Mmm dd yyyy"), formatted as
@@ -2477,14 +2482,14 @@ void MainWindow::startAdbKmsg()
 bool MainWindow::queryDeviceBootTime( double& bootEpochSec, int& tzOffsetSec )
 {
     const QString adbExecutable = QStandardPaths::findExecutable( QStringLiteral( "adb" ) );
-    if ( adbExecutable.isEmpty() || !adbHasAuthorizedDevice( adbExecutable ) ) {
+    if ( adbExecutable.isEmpty() || adbAuthorizedDevices( adbExecutable ).isEmpty() ) {
         return false;
     }
 
     QProcess p;
-    p.start( adbExecutable, QStringList()
+    p.start( adbExecutable, adbArgs( QStringList()
                                 << QStringLiteral( "shell" )
-                                << QStringLiteral( "date +%s.%N; cat /proc/uptime; date +%z" ) );
+                                << QStringLiteral( "date +%s.%N; cat /proc/uptime; date +%z" ) ) );
     if ( !p.waitForFinished( 15000 ) ) {
         return false;
     }
@@ -2952,6 +2957,52 @@ void MainWindow::mergeOpenFilesOffline()
 }
 
 
+bool MainWindow::ensureAdbDevice( const QString& adbExecutable )
+{
+    const QStringList devices = adbAuthorizedDevices( adbExecutable );
+    if ( devices.isEmpty() ) {
+        adbSerial_.clear();
+        QMessageBox::warning(
+            this, tr( "klogg" ),
+            tr( "No authorized device found. Connect a device and check \"adb devices\"." ) );
+        return false;
+    }
+
+    // Reuse a previous choice while that device is still attached.
+    if ( !adbSerial_.isEmpty() && devices.contains( adbSerial_ ) ) {
+        return true;
+    }
+
+    // A single device needs no `-s`; target it implicitly.
+    if ( devices.size() == 1 ) {
+        adbSerial_ = devices.first();
+        return true;
+    }
+
+    // Several devices attached: let the user pick which one to talk to.
+    bool ok = false;
+    const int current = devices.indexOf( adbSerial_ );
+    const QString chosen = QInputDialog::getItem(
+        this, tr( "Select ADB device" ),
+        tr( "Multiple devices detected. Choose the device for ADB commands:" ), devices,
+        current >= 0 ? current : 0, /*editable=*/false, &ok );
+    if ( !ok || chosen.isEmpty() ) {
+        return false;
+    }
+    adbSerial_ = chosen;
+    return true;
+}
+
+QStringList MainWindow::adbArgs( const QStringList& subCommand ) const
+{
+    QStringList args;
+    if ( !adbSerial_.isEmpty() ) {
+        args << QStringLiteral( "-s" ) << adbSerial_;
+    }
+    args << subCommand;
+    return args;
+}
+
 void MainWindow::startAdbCapture( const QString& logPath, const QStringList& captureArgs,
                                   bool prepareLogcatBuffer, bool requireRoot, bool useKmsgSlot )
 {
@@ -2970,10 +3021,7 @@ void MainWindow::startAdbCapture( const QString& logPath, const QStringList& cap
         return;
     }
 
-    if ( !adbHasAuthorizedDevice( adbExecutable ) ) {
-        QMessageBox::warning(
-            this, tr( "klogg" ),
-            tr( "No authorized device found. Connect a device and check \"adb devices\"." ) );
+    if ( !ensureAdbDevice( adbExecutable ) ) {
         return;
     }
 
@@ -2982,11 +3030,12 @@ void MainWindow::startAdbCapture( const QString& logPath, const QStringList& cap
         // re-establishes the device transport, so wait for it to come back
         // before issuing the capture command.
         QProcess rootProc;
-        rootProc.start( adbExecutable, QStringList() << QStringLiteral( "root" ) );
+        rootProc.start( adbExecutable, adbArgs( QStringList() << QStringLiteral( "root" ) ) );
         rootProc.waitForFinished( 15000 );
 
         QProcess waitProc;
-        waitProc.start( adbExecutable, QStringList() << QStringLiteral( "wait-for-device" ) );
+        waitProc.start( adbExecutable,
+                        adbArgs( QStringList() << QStringLiteral( "wait-for-device" ) ) );
         if ( !waitProc.waitForFinished( 20000 ) ) {
             QMessageBox::critical( this, tr( "klogg" ),
                                    tr( "Timed out waiting for device after adb root." ) );
@@ -3026,14 +3075,15 @@ void MainWindow::startAdbCapture( const QString& logPath, const QStringList& cap
         // treat a failure here as fatal - capture can still proceed.
         QProcess setBufferProc;
         setBufferProc.start( adbExecutable,
-                             QStringList() << QStringLiteral( "logcat" ) << QStringLiteral( "-G" )
-                                           << QStringLiteral( "512M" ) );
+                             adbArgs( QStringList() << QStringLiteral( "logcat" )
+                                                    << QStringLiteral( "-G" )
+                                                    << QStringLiteral( "512M" ) ) );
         setBufferProc.waitForFinished( 15000 );
 
         // Clear device log buffer
         QProcess clearProc;
-        clearProc.start( adbExecutable,
-                         QStringList() << QStringLiteral( "logcat" ) << QStringLiteral( "-c" ) );
+        clearProc.start( adbExecutable, adbArgs( QStringList() << QStringLiteral( "logcat" )
+                                                              << QStringLiteral( "-c" ) ) );
         if ( !clearProc.waitForFinished( 15000 ) ) {
             QMessageBox::critical( this, tr( "klogg" ), tr( "adb logcat -c timed out." ) );
             return;
@@ -3051,7 +3101,7 @@ void MainWindow::startAdbCapture( const QString& logPath, const QStringList& cap
     // Start adb process - write directly to file via kernel (no Qt event loop bottleneck)
     proc = new QProcess( this );
     proc->setStandardOutputFile( logPath, QIODevice::Truncate );
-    proc->start( adbExecutable, captureArgs );
+    proc->start( adbExecutable, adbArgs( captureArgs ) );
     if ( !proc->waitForStarted( 5000 ) ) {
         QMessageBox::critical( this, tr( "klogg" ), tr( "Could not start adb capture." ) );
         proc->deleteLater();
@@ -3147,25 +3197,22 @@ void MainWindow::killCameraAdb()
         return;
     }
 
-    if ( !adbHasAuthorizedDevice( adbExecutable ) ) {
-        QMessageBox::warning(
-            this, tr( "klogg" ),
-            tr( "No authorized device found. Connect a device and check \"adb devices\"." ) );
+    if ( !ensureAdbDevice( adbExecutable ) ) {
         return;
     }
 
     // Restart adbd with root permissions (best-effort; may already be root or
     // unsupported on production builds).
     QProcess rootProc;
-    rootProc.start( adbExecutable, QStringList() << QStringLiteral( "root" ) );
+    rootProc.start( adbExecutable, adbArgs( QStringList() << QStringLiteral( "root" ) ) );
     rootProc.waitForFinished( 15000 );
 
     // Kill any process whose command line matches "camera".
     QProcess killProc;
-    killProc.start( adbExecutable, QStringList() << QStringLiteral( "shell" )
-                                                 << QStringLiteral( "pkill" )
-                                                 << QStringLiteral( "-f" )
-                                                 << QStringLiteral( "camera" ) );
+    killProc.start( adbExecutable, adbArgs( QStringList() << QStringLiteral( "shell" )
+                                                          << QStringLiteral( "pkill" )
+                                                          << QStringLiteral( "-f" )
+                                                          << QStringLiteral( "camera" ) ) );
     if ( !killProc.waitForFinished( 15000 ) ) {
         QMessageBox::critical( this, tr( "klogg" ), tr( "adb shell pkill timed out." ) );
         return;
@@ -3223,9 +3270,9 @@ void MainWindow::updateCameraProviderPid()
             } );
     }
 
-    cameraPidProcess_->start( adbExecutable, QStringList() << QStringLiteral( "shell" )
-                                                           << QStringLiteral( "ps" )
-                                                           << QStringLiteral( "-ef" ) );
+    cameraPidProcess_->start( adbExecutable, adbArgs( QStringList() << QStringLiteral( "shell" )
+                                                                    << QStringLiteral( "ps" )
+                                                                    << QStringLiteral( "-ef" ) ) );
 }
 
 void MainWindow::applyCameraProviderPid( const QString& pid )
