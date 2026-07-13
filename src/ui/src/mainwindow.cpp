@@ -299,7 +299,10 @@ void MainWindow::reloadGeometry()
 void MainWindow::reloadSession()
 {
     const auto& config = Configuration::get();
-    const auto followFileOnLoad = config.followFileOnLoad() && config.anyFileWatchEnabled();
+    // Restored files follow by default so live logs tail automatically,
+    // regardless of the persisted "follow on load" preference (matches the
+    // behaviour of freshly opened files in loadFile()).
+    const auto followFileOnLoad = config.anyFileWatchEnabled();
 
     int current_file_index = -1;
     const auto openedFiles
