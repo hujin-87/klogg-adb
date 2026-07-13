@@ -146,7 +146,8 @@ class MainWindow : public QMainWindow {
     void quickSaveAdbLogcat();
     void killCameraAdb();
     void updateCameraProviderPid();
-    void applyCameraProviderPid( const QString& pid );
+    void updateCameraDeviceCount();
+    void applyCameraLabel( const QString& pid, const QString& deviceCount );
     void showAutoClosingSavedDialog( const QString& savePath );
     void onColorLabelsChanged( const ColorLabelsManager::QuickHighlightersCollection& labels );
 
@@ -377,7 +378,12 @@ class MainWindow : public QMainWindow {
     QString adbSerial_;
 
     QProcess* cameraPidProcess_ = nullptr;
+    QProcess* cameraDeviceProcess_ = nullptr;
     QTimer* cameraPidTimer_ = nullptr;
+
+    // Latest camera.provider PID, held between the ps query and the follow-up
+    // "dumpsys media.camera" device-count query so both land in one label.
+    QString cameraProviderPid_;
 
     ColorLabelsManager::QuickHighlightersCollection globalColorLabels_;
 

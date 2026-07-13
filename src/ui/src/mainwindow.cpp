@@ -3240,7 +3240,7 @@ void MainWindow::updateCameraProviderPid()
 
     const QString adbExecutable = QStandardPaths::findExecutable( QStringLiteral( "adb" ) );
     if ( adbExecutable.isEmpty() ) {
-        applyCameraProviderPid( QString() );
+        applyCameraLabel( QString(), QString() );
         return;
     }
 
@@ -3266,7 +3266,9 @@ void MainWindow::updateCameraProviderPid()
                         break;
                     }
                 }
-                applyCameraProviderPid( pid );
+                cameraProviderPid_ = pid;
+                // Chain the device-count query so both values land in one label.
+                updateCameraDeviceCount();
             } );
     }
 
@@ -3275,10 +3277,71 @@ void MainWindow::updateCameraProviderPid()
                                                                     << QStringLiteral( "-ef" ) ) );
 }
 
-void MainWindow::applyCameraProviderPid( const QString& pid )
+void MainWindow::updateCameraDeviceCount()
 {
-    const QString shown = pid.isEmpty() ? QStringLiteral( "hujin" ) : pid;
-    adbKillCameraAction->setText( tr( "Kill Camera(F4) [%1]" ).arg( shown ) );
+    // Skip if a previous query is still running to avoid piling up processes.
+    if ( cameraDeviceProcess_ && cameraDeviceProcess_->state() != QProcess::NotRunning ) {
+        return;
+    }
+
+    const QString adbExecutable = QStandardPaths::findExecutable( QStringLiteral( "adb" ) );
+    if ( adbExecutable.isEmpty() ) {
+        applyCameraLabel( cameraProviderPid_, QString() );
+        return;
+    }
+
+    if ( !cameraDeviceProcess_ ) {
+        cameraDeviceProcess_ = new QProcess( this );
+        connect(
+            cameraDeviceProcess_,
+            static_cast<void ( QProcess::* )( int, QProcess::ExitStatus )>( &QProcess::finished ),
+            this, [ this ]( int, QProcess::ExitStatus ) {
+                const auto output
+                    = QString::fromUtf8( cameraDeviceProcess_->readAllStandardOutput() );
+                // Expected line: "Number of camera devices: 2". Take the digits
+                // after the last colon; anything non-numeric falls back to "xxx".
+                QString count;
+                const auto lines = output.split( QLatin1Char( '\n' ) );
+                for ( const auto& line : lines ) {
+                    if ( !line.contains( QStringLiteral( "Number of camera devices" ),
+                                         Qt::CaseInsensitive ) ) {
+                        continue;
+                    }
+                    const int colon = line.lastIndexOf( QLatin1Char( ':' ) );
+                    if ( colon >= 0 ) {
+                        count = line.mid( colon + 1 ).trimmed();
+                    }
+                    break;
+                }
+                applyCameraLabel( cameraProviderPid_, count );
+            } );
+    }
+
+    // Run the pipe on the device's shell as a single argument.
+    cameraDeviceProcess_->start(
+        adbExecutable,
+        adbArgs( QStringList()
+                 << QStringLiteral( "shell" )
+                 << QStringLiteral(
+                        "dumpsys media.camera | grep -iE 'Number of camera devices'" ) ) );
+}
+
+void MainWindow::applyCameraLabel( const QString& pid, const QString& deviceCount )
+{
+    const QString pidShown = pid.isEmpty() ? QStringLiteral( "hujin" ) : pid;
+
+    // Only accept a plain Arabic-numeral count; otherwise show the literal "xxx".
+    bool numeric = !deviceCount.isEmpty();
+    for ( const QChar ch : deviceCount ) {
+        if ( ch < QLatin1Char( '0' ) || ch > QLatin1Char( '9' ) ) {
+            numeric = false;
+            break;
+        }
+    }
+    const QString countShown = numeric ? deviceCount : QStringLiteral( "xxx" );
+
+    adbKillCameraAction->setText(
+        tr( "Kill Camera(F4) [%1-%2]" ).arg( pidShown, countShown ) );
 }
 
 void MainWindow::showAutoClosingSavedDialog( const QString& savePath )
