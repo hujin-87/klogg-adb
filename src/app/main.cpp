@@ -182,7 +182,7 @@ int main( int argc, char* argv[] )
         else {
             mw = app.newWindow();
             mw->reloadGeometry();
-            mw->show();
+            mw->showMaximized();
         }
 
         if ( parameters.window_width > 0 && parameters.window_height > 0 ) {

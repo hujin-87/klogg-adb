@@ -144,12 +144,12 @@ class KloggApp : public QApplication {
             auto w = newWindow( std::move( windowSession ) );
             w->reloadGeometry();
             w->reloadSession();
-            w->show();
+            w->showMaximized();
         }
 
         if ( mainWindows_.empty() ) {
             auto w = newWindow();
-            w->show();
+            w->showMaximized();
         }
 
         return mainWindows_.back().second;
@@ -243,7 +243,7 @@ class KloggApp : public QApplication {
         activeWindows_.push( QPointer<MainWindow>( window ) );
 
         LOG_INFO << "Window " << &window << " created";
-        connect( window, &MainWindow::newWindow, [ = ]() { newWindow()->show(); } );
+        connect( window, &MainWindow::newWindow, [ = ]() { newWindow()->showMaximized(); } );
         connect( window, &MainWindow::windowActivated,
                  [ this, window ]() { onWindowActivated( *window ); } );
         connect( window, &MainWindow::windowClosed,
