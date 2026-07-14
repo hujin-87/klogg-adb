@@ -3331,7 +3331,7 @@ void MainWindow::updateCameraDeviceCount()
 
 void MainWindow::applyCameraLabel( const QString& pid, const QString& deviceCount )
 {
-    const QString pidShown = pid.isEmpty() ? QStringLiteral( "hujin" ) : pid;
+    const QString pidShown = pid.isEmpty() ? QStringLiteral( "NULL-" ) : pid;
 
     // Only accept a plain Arabic-numeral count; otherwise show the literal "xxx".
     bool numeric = !deviceCount.isEmpty();
