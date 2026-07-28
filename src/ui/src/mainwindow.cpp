@@ -3006,14 +3006,135 @@ QStringList MainWindow::adbArgs( const QStringList& subCommand ) const
     return args;
 }
 
+// One adb command run sequentially by runAdbSequence(). validate() decides whether
+// to continue to the next step (true) or abort the whole sequence (false); it also
+// pops any error dialog. timedOut signals that the watchdog fired for this step.
+struct AdbStep {
+    QStringList args;
+    int timeoutMs;
+    std::function<bool( QProcess&, bool timedOut )> validate;
+};
+
+// Heap state kept alive across the async step chain (see runAdbSequence). Owned as
+// a raw pointer and deleted exactly once in finishAdbSequence(); the QObject members
+// are parented to the MainWindow and torn down via deleteLater().
+struct AdbSequenceContext {
+    QString adbExecutable;
+    std::vector<AdbStep> steps;
+    std::function<void()> onSuccess;
+    size_t index = 0;
+    QProcess* proc = nullptr;
+    QTimer* watchdog = nullptr;
+    QProgressDialog* dialog = nullptr;
+    bool stepHandled = false; // guards finished-vs-watchdog double handling per step
+    bool done = false;        // guards finishAdbSequence running more than once
+};
+
+void MainWindow::runAdbSequence( const QString& adbExecutable, const QString& busyLabel,
+                                 std::vector<AdbStep> steps, std::function<void()> onSuccess )
+{
+    if ( steps.empty() ) {
+        if ( onSuccess ) {
+            onSuccess();
+        }
+        return;
+    }
+
+    auto* ctx = new AdbSequenceContext;
+    ctx->adbExecutable = adbExecutable;
+    ctx->steps = std::move( steps );
+    ctx->onSuccess = std::move( onSuccess );
+    ctx->proc = new QProcess( this );
+    ctx->watchdog = new QTimer( this );
+    ctx->watchdog->setSingleShot( true );
+
+    // Busy (0,0) modal dialog: keeps the UI painting/cancelable and blocks a second
+    // F1/F4/F6 trigger from starting an overlapping sequence.
+    ctx->dialog = new QProgressDialog( busyLabel, tr( "Cancel" ), 0, 0, this );
+    ctx->dialog->setWindowModality( Qt::ApplicationModal );
+    ctx->dialog->setMinimumDuration( 0 );
+    ctx->dialog->setAutoClose( false );
+    ctx->dialog->setAutoReset( false );
+
+    // A completed step: stop the watchdog, let validate() decide, then advance.
+    const auto handleStep = [ this, ctx ]( bool timedOut ) {
+        if ( ctx->stepHandled ) {
+            return;
+        }
+        ctx->stepHandled = true;
+        ctx->watchdog->stop();
+
+        const AdbStep& step = ctx->steps[ ctx->index ];
+        const bool proceed = step.validate ? step.validate( *ctx->proc, timedOut ) : true;
+        if ( !proceed ) {
+            finishAdbSequence( ctx, false );
+            return;
+        }
+        ++ctx->index;
+        if ( ctx->index >= ctx->steps.size() ) {
+            finishAdbSequence( ctx, true );
+            return;
+        }
+        advanceAdbSequence( ctx );
+    };
+
+    connect( ctx->proc,
+             static_cast<void ( QProcess::* )( int, QProcess::ExitStatus )>( &QProcess::finished ),
+             this, [ handleStep ]( int, QProcess::ExitStatus ) { handleStep( false ); } );
+    // FailedToStart (no finished signal) also flows here so the chain never hangs.
+    connect( ctx->proc, &QProcess::errorOccurred, this,
+             [ handleStep ]( QProcess::ProcessError ) { handleStep( false ); } );
+    connect( ctx->watchdog, &QTimer::timeout, this, [ this, ctx, handleStep ]() {
+        if ( ctx->proc->state() != QProcess::NotRunning ) {
+            ctx->proc->kill();
+        }
+        handleStep( true );
+    } );
+    connect( ctx->dialog, &QProgressDialog::canceled, this,
+             [ this, ctx ]() { finishAdbSequence( ctx, false ); } );
+
+    ctx->dialog->show();
+    advanceAdbSequence( ctx );
+}
+
+void MainWindow::advanceAdbSequence( AdbSequenceContext* ctx )
+{
+    ctx->stepHandled = false;
+    const AdbStep& step = ctx->steps[ ctx->index ];
+    ctx->watchdog->start( step.timeoutMs );
+    ctx->proc->start( ctx->adbExecutable, adbArgs( step.args ) );
+}
+
+void MainWindow::finishAdbSequence( AdbSequenceContext* ctx, bool ok )
+{
+    if ( ctx->done ) {
+        return;
+    }
+    ctx->done = true;
+
+    ctx->watchdog->stop();
+    ctx->proc->disconnect();
+    if ( ctx->proc->state() != QProcess::NotRunning ) {
+        ctx->proc->kill();
+        ctx->proc->waitForFinished( 200 );
+    }
+    ctx->proc->deleteLater();
+    ctx->watchdog->deleteLater();
+    ctx->dialog->deleteLater();
+
+    auto onSuccess = std::move( ctx->onSuccess );
+    delete ctx;
+
+    if ( ok && onSuccess ) {
+        onSuccess();
+    }
+}
+
 void MainWindow::startAdbCapture( const QString& logPath, const QStringList& captureArgs,
                                   bool prepareLogcatBuffer, bool requireRoot, bool useKmsgSlot )
 {
     // Use the separate F6 kernel-log slot or the F1/F2 logcat slot.
-    QProcess*& proc = useKmsgSlot ? adbKmsgProcess_ : adbLogcatProcess_;
-    QString& filePathRef = useKmsgSlot ? adbKmsgFilePath_ : adbLogcatFilePath_;
-
-    if ( proc != nullptr ) {
+    if ( ( useKmsgSlot ? adbKmsgProcess_ : adbLogcatProcess_ ) != nullptr ) {
         return;
     }
 
@@ -3026,24 +3147,6 @@ void MainWindow::startAdbCapture( const QString& logPath, const QStringList& cap
 
     if ( !ensureAdbDevice( adbExecutable ) ) {
         return;
-    }
-
-    if ( requireRoot ) {
-        // Restart adbd as root (needed to read /dev/kmsg). This drops and
-        // re-establishes the device transport, so wait for it to come back
-        // before issuing the capture command.
-        QProcess rootProc;
-        rootProc.start( adbExecutable, adbArgs( QStringList() << QStringLiteral( "root" ) ) );
-        rootProc.waitForFinished( 15000 );
-
-        QProcess waitProc;
-        waitProc.start( adbExecutable,
-                        adbArgs( QStringList() << QStringLiteral( "wait-for-device" ) ) );
-        if ( !waitProc.waitForFinished( 20000 ) ) {
-            QMessageBox::critical( this, tr( "klogg" ),
-                                   tr( "Timed out waiting for device after adb root." ) );
-            return;
-        }
     }
 
     const auto& config = Configuration::get();
@@ -3062,13 +3165,27 @@ void MainWindow::startAdbCapture( const QString& logPath, const QStringList& cap
         previousColorLabels = currentCrawler->currentColorLabels();
     }
 
-    // If the file is already open in a tab, close that tab first
-    auto* existingView = static_cast<CrawlerWidget*>( session_.getViewIfOpen( logPath ) );
-    if ( existingView ) {
-        int tabIndex = mainTabWidget_.indexOf( existingView );
-        if ( tabIndex >= 0 ) {
-            closeTab( tabIndex, ActionInitiator::App );
-        }
+    // Build the preparation commands. These used to run synchronously with
+    // waitForFinished(), freezing the UI for up to ~35s (logcat) / ~40s (kmsg)
+    // on a misbehaving device. They now run one at a time via runAdbSequence()
+    // behind a cancelable busy dialog; the actual capture starts in onSuccess.
+    std::vector<AdbStep> steps;
+    if ( requireRoot ) {
+        // Restart adbd as root (needed to read /dev/kmsg). Best-effort: a failure
+        // or timeout here is not fatal, capture may still work.
+        steps.push_back( { QStringList() << QStringLiteral( "root" ), 15000, nullptr } );
+        // Restarting adbd drops and re-establishes the transport, so wait for the
+        // device to come back before issuing the capture command.
+        steps.push_back(
+            { QStringList() << QStringLiteral( "wait-for-device" ), 20000,
+              [ this ]( QProcess&, bool timedOut ) {
+                  if ( timedOut ) {
+                      QMessageBox::critical( this, tr( "klogg" ),
+                                             tr( "Timed out waiting for device after adb root." ) );
+                      return false;
+                  }
+                  return true;
+              } } );
     }
 
     if ( prepareLogcatBuffer ) {
@@ -3076,72 +3193,92 @@ void MainWindow::startAdbCapture( const QString& logPath, const QStringList& cap
         // Some buffers (e.g. kernel) may not be resizable on all devices, which makes
         // adb return non-zero even when the other buffers were enlarged, so we don't
         // treat a failure here as fatal - capture can still proceed.
-        QProcess setBufferProc;
-        setBufferProc.start( adbExecutable,
-                             adbArgs( QStringList() << QStringLiteral( "logcat" )
-                                                    << QStringLiteral( "-G" )
-                                                    << QStringLiteral( "512M" ) ) );
-        setBufferProc.waitForFinished( 15000 );
+        steps.push_back( { QStringList() << QStringLiteral( "logcat" ) << QStringLiteral( "-G" )
+                                         << QStringLiteral( "512M" ),
+                           15000, nullptr } );
+        // Clear device log buffer.
+        steps.push_back(
+            { QStringList() << QStringLiteral( "logcat" ) << QStringLiteral( "-c" ), 15000,
+              [ this ]( QProcess& proc, bool timedOut ) {
+                  if ( timedOut ) {
+                      QMessageBox::critical( this, tr( "klogg" ), tr( "adb logcat -c timed out." ) );
+                      return false;
+                  }
+                  if ( proc.exitCode() != 0 ) {
+                      const auto err = QString::fromUtf8( proc.readAllStandardError() );
+                      QMessageBox::critical( this, tr( "klogg" ),
+                                             tr( "adb logcat -c failed:\n%1" ).arg( err ) );
+                      return false;
+                  }
+                  return true;
+              } } );
+    }
 
-        // Clear device log buffer
-        QProcess clearProc;
-        clearProc.start( adbExecutable, adbArgs( QStringList() << QStringLiteral( "logcat" )
-                                                              << QStringLiteral( "-c" ) ) );
-        if ( !clearProc.waitForFinished( 15000 ) ) {
-            QMessageBox::critical( this, tr( "klogg" ), tr( "adb logcat -c timed out." ) );
+    // The real capture: unchanged from the previous synchronous implementation,
+    // just relocated into the completion callback. adb output is written straight
+    // to the file by the kernel (no Qt event loop per line); the tab follows it.
+    auto onSuccess = [ this, adbExecutable, logPath, captureArgs, useKmsgSlot, previousSearchText,
+                       previousColorLabels ]() {
+        QProcess*& proc = useKmsgSlot ? adbKmsgProcess_ : adbLogcatProcess_;
+        QString& filePathRef = useKmsgSlot ? adbKmsgFilePath_ : adbLogcatFilePath_;
+
+        // If the file is already open in a tab, close that tab first.
+        auto* existingView = static_cast<CrawlerWidget*>( session_.getViewIfOpen( logPath ) );
+        if ( existingView ) {
+            int tabIndex = mainTabWidget_.indexOf( existingView );
+            if ( tabIndex >= 0 ) {
+                closeTab( tabIndex, ActionInitiator::App );
+            }
+        }
+
+        filePathRef = logPath;
+
+        // Start adb process - write directly to file via kernel (no Qt event loop bottleneck)
+        proc = new QProcess( this );
+        proc->setStandardOutputFile( logPath, QIODevice::Truncate );
+        proc->start( adbExecutable, adbArgs( captureArgs ) );
+        if ( !proc->waitForStarted( 5000 ) ) {
+            QMessageBox::critical( this, tr( "klogg" ), tr( "Could not start adb capture." ) );
+            proc->deleteLater();
+            proc = nullptr;
             return;
         }
-        if ( clearProc.exitCode() != 0 ) {
-            const auto err = QString::fromUtf8( clearProc.readAllStandardError() );
-            QMessageBox::critical( this, tr( "klogg" ),
-                                   tr( "adb logcat -c failed:\n%1" ).arg( err ) );
+
+        // Open the file in klogg with follow mode
+        if ( !loadFile( logPath, true ) ) {
+            if ( useKmsgSlot ) {
+                cleanupAdbKmsgProcess();
+            }
+            else {
+                cleanupAdbLogcatProcess();
+            }
             return;
         }
-    }
 
-    filePathRef = logPath;
-
-    // Start adb process - write directly to file via kernel (no Qt event loop bottleneck)
-    proc = new QProcess( this );
-    proc->setStandardOutputFile( logPath, QIODevice::Truncate );
-    proc->start( adbExecutable, adbArgs( captureArgs ) );
-    if ( !proc->waitForStarted( 5000 ) ) {
-        QMessageBox::critical( this, tr( "klogg" ), tr( "Could not start adb capture." ) );
-        proc->deleteLater();
-        proc = nullptr;
-        return;
-    }
-
-    // Open the file in klogg with follow mode
-    if ( !loadFile( logPath, true ) ) {
-        if ( useKmsgSlot ) {
-            cleanupAdbKmsgProcess();
+        // Set search text from previous tab and enable auto-refresh for real-time filtering
+        // Also restore color labels (Ctrl+D highlights) from previous tab
+        if ( auto* crawler = currentCrawlerWidget() ) {
+            // Always start the capture tab case-insensitive
+            crawler->setMatchCase( false );
+            crawler->startSearchWithAutoRefresh( previousSearchText );
+            if ( !previousColorLabels.empty() ) {
+                crawler->restoreColorLabels( previousColorLabels );
+            }
         }
-        else {
-            cleanupAdbLogcatProcess();
+
+        // Colour the capturing file's tab green while the capture is running.
+        mainTabWidget_.setTabColorForFile( logPath, QColor( 0x4c, 0xaf, 0x50 ) );
+
+        // Only the F1/F2 logcat capture toggles those actions; F6 stays independent.
+        if ( !useKmsgSlot ) {
+            adbLogcatStartAction->setEnabled( false );
+            adbLogcatStopAction->setEnabled( true );
         }
-        return;
-    }
+    };
 
-    // Set search text from previous tab and enable auto-refresh for real-time filtering
-    // Also restore color labels (Ctrl+D highlights) from previous tab
-    if ( auto* crawler = currentCrawlerWidget() ) {
-        // Always start the capture tab case-insensitive
-        crawler->setMatchCase( false );
-        crawler->startSearchWithAutoRefresh( previousSearchText );
-        if ( !previousColorLabels.empty() ) {
-            crawler->restoreColorLabels( previousColorLabels );
-        }
-    }
-
-    // Colour the capturing file's tab green while the capture is running.
-    mainTabWidget_.setTabColorForFile( logPath, QColor( 0x4c, 0xaf, 0x50 ) );
-
-    // Only the F1/F2 logcat capture toggles those actions; F6 stays independent.
-    if ( !useKmsgSlot ) {
-        adbLogcatStartAction->setEnabled( false );
-        adbLogcatStopAction->setEnabled( true );
-    }
+    // Run the prep sequence (may be empty, in which case onSuccess fires immediately).
+    runAdbSequence( adbExecutable, tr( "Preparing adb capture..." ), std::move( steps ),
+                    std::move( onSuccess ) );
 }
 
 void MainWindow::quickSaveAdbLogcat()
@@ -3204,34 +3341,34 @@ void MainWindow::killCameraAdb()
         return;
     }
 
+    std::vector<AdbStep> steps;
     // Restart adbd with root permissions (best-effort; may already be root or
-    // unsupported on production builds).
-    QProcess rootProc;
-    rootProc.start( adbExecutable, adbArgs( QStringList() << QStringLiteral( "root" ) ) );
-    rootProc.waitForFinished( 15000 );
-
+    // unsupported on production builds). Not fatal on failure/timeout.
+    steps.push_back( { QStringList() << QStringLiteral( "root" ), 15000, nullptr } );
     // Kill any process whose command line matches "camera".
-    QProcess killProc;
-    killProc.start( adbExecutable, adbArgs( QStringList() << QStringLiteral( "shell" )
-                                                          << QStringLiteral( "pkill" )
-                                                          << QStringLiteral( "-f" )
-                                                          << QStringLiteral( "camera" ) ) );
-    if ( !killProc.waitForFinished( 15000 ) ) {
-        QMessageBox::critical( this, tr( "klogg" ), tr( "adb shell pkill timed out." ) );
-        return;
-    }
-
-    // pkill returns non-zero (1) when no process matched, which is not an error
-    // worth surfacing; only report genuine execution failures.
-    const int exitCode = killProc.exitCode();
-    if ( exitCode != 0 && exitCode != 1 ) {
-        const auto err = QString::fromUtf8( killProc.readAllStandardError() );
-        QMessageBox::critical( this, tr( "klogg" ),
-                               tr( "adb shell pkill -f camera failed:\n%1" ).arg( err ) );
-    }
+    steps.push_back(
+        { QStringList() << QStringLiteral( "shell" ) << QStringLiteral( "pkill" )
+                        << QStringLiteral( "-f" ) << QStringLiteral( "camera" ),
+          15000, [ this ]( QProcess& proc, bool timedOut ) {
+              if ( timedOut ) {
+                  QMessageBox::critical( this, tr( "klogg" ), tr( "adb shell pkill timed out." ) );
+                  return false;
+              }
+              // pkill returns non-zero (1) when no process matched, which is not an
+              // error worth surfacing; only report genuine execution failures, but
+              // still refresh the label afterwards (return true).
+              const int exitCode = proc.exitCode();
+              if ( exitCode != 0 && exitCode != 1 ) {
+                  const auto err = QString::fromUtf8( proc.readAllStandardError() );
+                  QMessageBox::critical( this, tr( "klogg" ),
+                                         tr( "adb shell pkill -f camera failed:\n%1" ).arg( err ) );
+              }
+              return true;
+          } } );
 
     // The kill just changed the process table; refresh the F4 label right away.
-    updateCameraProviderPid();
+    runAdbSequence( adbExecutable, tr( "Killing camera processes..." ), std::move( steps ),
+                    [ this ]() { updateCameraProviderPid(); } );
 }
 
 void MainWindow::updateCameraProviderPid()

@@ -46,12 +46,16 @@
 
 #include <QTranslator>
 #include <array>
+#include <functional>
 #include <memory>
 #include <mutex>
+#include <vector>
 
 class QFile;
 class QProcess;
 class QTimer;
+struct AdbStep;
+struct AdbSequenceContext;
 
 #include "configuration.h"
 #include "crawlerwidget.h"
@@ -263,6 +267,16 @@ class MainWindow : public QMainWindow {
     // Build an adb argument list, prepending `-s <serial>` when a target device
     // has been selected so the command is directed at that specific device.
     QStringList adbArgs( const QStringList& subCommand ) const;
+    // Run a sequence of adb preparation commands asynchronously (one at a time),
+    // showing a modal, cancelable busy dialog so the UI stays responsive instead
+    // of blocking on waitForFinished(). Each step's validate() decides whether to
+    // proceed; onSuccess() runs only if every step succeeds and the user does not
+    // cancel. See AdbStep in mainwindow.cpp.
+    void runAdbSequence( const QString& adbExecutable, const QString& busyLabel,
+                         std::vector<AdbStep> steps, std::function<void()> onSuccess );
+    // Internal helpers driving runAdbSequence's state machine over a heap context.
+    void advanceAdbSequence( AdbSequenceContext* ctx );
+    void finishAdbSequence( AdbSequenceContext* ctx, bool ok );
     // Convert a raw /dev/kmsg capture at srcPath into logcat threadtime format at
     // dstPath using the given boot time. Returns false on I/O error.
     bool convertKmsgFile( const QString& srcPath, const QString& dstPath, double bootEpochSec,
