@@ -698,9 +698,20 @@ void MainWindow::createActions()
 
     adbLogcatStartAction = new QAction( tr( action::adbLogcatStartText ), this );
     adbLogcatStartAction->setStatusTip( tr( action::adbLogcatStartStatusTip ) );
-    adbLogcatStartAction->setShortcut( QKeySequence( Qt::Key_F1 ) );
     connect( adbLogcatStartAction, &QAction::triggered, this,
              [ this ]( auto ) { this->startAdbLogcat(); } );
+
+    // F1 is handled by a window-level shortcut instead of the action itself:
+    // while a capture is running the start action is greyed out (and a
+    // disabled action's shortcut would not fire), so F1 falls through to
+    // "Follow File" in that case.
+    auto* f1Shortcut = new QShortcut( QKeySequence( Qt::Key_F1 ), this );
+    connect( f1Shortcut, &QShortcut::activated, this, [ this ] {
+        if ( adbLogcatStartAction->isEnabled() )
+            adbLogcatStartAction->trigger();
+        else
+            followAction->trigger();
+    } );
 
     adbLogcatStopAction = new QAction( tr( action::adbLogcatStopText ), this );
     adbLogcatStopAction->setStatusTip( tr( action::adbLogcatStopStatusTip ) );
