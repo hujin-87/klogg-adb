@@ -3020,10 +3020,14 @@ QStringList MainWindow::adbArgs( const QStringList& subCommand ) const
 // One adb command run sequentially by runAdbSequence(). validate() decides whether
 // to continue to the next step (true) or abort the whole sequence (false); it also
 // pops any error dialog. timedOut signals that the watchdog fired for this step.
+// shouldRun(), when set, is evaluated just before the step starts and skips it when
+// false - that is how a step can react to what an earlier step observed (a fallback
+// that only runs after a failure, a command that only runs if a path is missing).
 struct AdbStep {
     QStringList args;
     int timeoutMs;
     std::function<bool( QProcess&, bool timedOut )> validate;
+    std::function<bool()> shouldRun = nullptr;
 };
 
 // Heap state kept alive across the async step chain (see runAdbSequence). Owned as
@@ -3110,6 +3114,17 @@ void MainWindow::runAdbSequence( const QString& adbExecutable, const QString& bu
 
 void MainWindow::advanceAdbSequence( AdbSequenceContext* ctx )
 {
+    // Drop conditional steps that are not needed this run; skipping the tail of the
+    // list completes the sequence successfully.
+    while ( ctx->index < ctx->steps.size() && ctx->steps[ ctx->index ].shouldRun
+            && !ctx->steps[ ctx->index ].shouldRun() ) {
+        ++ctx->index;
+    }
+    if ( ctx->index >= ctx->steps.size() ) {
+        finishAdbSequence( ctx, true );
+        return;
+    }
+
     ctx->stepHandled = false;
     const AdbStep& step = ctx->steps[ ctx->index ];
     ctx->watchdog->start( step.timeoutMs );
@@ -3204,9 +3219,26 @@ void MainWindow::startAdbCapture( const QString& logPath, const QStringList& cap
         // Some buffers (e.g. kernel) may not be resizable on all devices, which makes
         // adb return non-zero even when the other buffers were enlarged, so we don't
         // treat a failure here as fatal - capture can still proceed.
+        auto bigBufferRejected = std::make_shared<bool>( false );
         steps.push_back( { QStringList() << QStringLiteral( "logcat" ) << QStringLiteral( "-G" )
                                          << QStringLiteral( "512M" ),
-                           15000, nullptr } );
+                           15000,
+                           [ bigBufferRejected ]( QProcess& proc, bool timedOut ) {
+                               // exitStatus() matters as much as exitCode(): when the
+                               // process crashes or fails to start Qt reports exitCode 0
+                               // with a non-normal status, which would otherwise read as
+                               // success and skip the retry below.
+                               *bigBufferRejected = timedOut
+                                   || proc.exitStatus() != QProcess::NormalExit
+                                   || proc.exitCode() != 0;
+                               return true;
+                           } } );
+        // Devices that refuse 512M (too little memory, per-buffer cap) often still
+        // accept a smaller size, so retry once at 256M. Also best-effort.
+        steps.push_back( { QStringList() << QStringLiteral( "logcat" ) << QStringLiteral( "-G" )
+                                         << QStringLiteral( "256M" ),
+                           15000, nullptr,
+                           [ bigBufferRejected ]() { return *bigBufferRejected; } } );
         // Clear device log buffer.
         steps.push_back(
             { QStringList() << QStringLiteral( "logcat" ) << QStringLiteral( "-c" ), 15000,
@@ -3215,7 +3247,7 @@ void MainWindow::startAdbCapture( const QString& logPath, const QStringList& cap
                       QMessageBox::critical( this, tr( "klogg" ), tr( "adb logcat -c timed out." ) );
                       return false;
                   }
-                  if ( proc.exitCode() != 0 ) {
+                  if ( proc.exitStatus() != QProcess::NormalExit || proc.exitCode() != 0 ) {
                       const auto err = QString::fromUtf8( proc.readAllStandardError() );
                       QMessageBox::critical( this, tr( "klogg" ),
                                              tr( "adb logcat -c failed:\n%1" ).arg( err ) );
@@ -3356,6 +3388,44 @@ void MainWindow::killCameraAdb()
     // Restart adbd with root permissions (best-effort; may already be root or
     // unsupported on production builds). Not fatal on failure/timeout.
     steps.push_back( { QStringList() << QStringLiteral( "root" ), 15000, nullptr } );
+    // adb root drops and re-establishes the transport, so wait for the device before
+    // issuing the shell commands below (same as the kmsg capture path). Unlike the kmsg
+    // path this is not fatal: a kill that runs anyway is better than silently killing
+    // nothing, so a timeout only warns and the sequence continues.
+    steps.push_back( { QStringList() << QStringLiteral( "wait-for-device" ), 20000,
+                       [ this ]( QProcess&, bool timedOut ) {
+                           if ( timedOut ) {
+                               QMessageBox::warning(
+                                   this, tr( "klogg" ),
+                                   tr( "Timed out waiting for device after adb root; "
+                                       "continuing anyway." ) );
+                           }
+                           return true;
+                       } } );
+    // Probe for /sys/module/camera and mount debugfs when it is absent, so the camera
+    // driver's debug nodes are reachable. The marker echo is used instead of the exit
+    // code because adb only forwards remote exit codes when the shell protocol is
+    // available. A timeout means "unknown", not "present", so it still tries the mount;
+    // the mount step is best-effort and absorbs its own failure.
+    auto cameraModuleMissing = std::make_shared<bool>( false );
+    steps.push_back(
+        { QStringList() << QStringLiteral( "shell" )
+                        << QStringLiteral( "[ -e /sys/module/camera ] && echo klogg_present "
+                                           "|| echo klogg_missing" ),
+          15000, [ cameraModuleMissing ]( QProcess& proc, bool timedOut ) {
+              const auto out = QString::fromUtf8( proc.readAllStandardOutput() );
+              *cameraModuleMissing
+                  = timedOut || out.contains( QLatin1String( "klogg_missing" ) );
+              return true;
+          } } );
+    // Best-effort: an already-mounted debugfs or a locked-down build fails here
+    // without blocking the kill below.
+    steps.push_back( { QStringList() << QStringLiteral( "shell" ) << QStringLiteral( "mount" )
+                                     << QStringLiteral( "-t" ) << QStringLiteral( "debugfs" )
+                                     << QStringLiteral( "debugfs" )
+                                     << QStringLiteral( "/sys/kernel/debug" ),
+                       15000, nullptr,
+                       [ cameraModuleMissing ]() { return *cameraModuleMissing; } } );
     // Kill any process whose command line matches "camera".
     steps.push_back(
         { QStringList() << QStringLiteral( "shell" ) << QStringLiteral( "pkill" )
