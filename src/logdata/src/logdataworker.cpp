@@ -39,8 +39,10 @@
 #include <chrono>
 #include <exception>
 #include <functional>
+#include <mutex>
 #include <qglobal.h>
 #include <qthread.h>
+#include <set>
 #include <string_view>
 #include <thread>
 
@@ -67,6 +69,43 @@
 #include "logdataworker.h"
 
 constexpr int IndexingBlockSize = 5 * 1024 * 1024;
+
+namespace {
+// Normalised paths of files klogg is appending to itself (see markAppendOnlyFile).
+// Tiny set, read from the indexing thread and written from the UI thread.
+std::mutex& appendOnlyFilesMutex()
+{
+    static std::mutex mutex;
+    return mutex;
+}
+std::set<QString>& appendOnlyFiles()
+{
+    static std::set<QString> files;
+    return files;
+}
+QString normalisedPath( const QString& fileName )
+{
+    return QFileInfo( fileName ).absoluteFilePath();
+}
+} // namespace
+
+void klogg::markAppendOnlyFile( const QString& fileName )
+{
+    std::lock_guard<std::mutex> lock( appendOnlyFilesMutex() );
+    appendOnlyFiles().insert( normalisedPath( fileName ) );
+}
+
+void klogg::unmarkAppendOnlyFile( const QString& fileName )
+{
+    std::lock_guard<std::mutex> lock( appendOnlyFilesMutex() );
+    appendOnlyFiles().erase( normalisedPath( fileName ) );
+}
+
+bool klogg::isAppendOnlyFile( const QString& fileName )
+{
+    std::lock_guard<std::mutex> lock( appendOnlyFilesMutex() );
+    return appendOnlyFiles().count( normalisedPath( fileName ) ) > 0;
+}
 
 qint64 IndexingData::getIndexedSize() const
 {
@@ -692,24 +731,29 @@ void IndexOperation::doIndex( OffsetInFile initialPosition )
     }
 
     const auto endFilePos = file.pos();
-    file.reset();
-    QByteArray hashBuffer( IndexingBlockSize, Qt::Uninitialized );
-    const auto headerHashSize = file.read( hashBuffer.data(), hashBuffer.size() );
-    FileDigest fastHashDigest;
-    fastHashDigest.addData( hashBuffer.data(), static_cast<size_t>( headerHashSize ) );
+    // The header/tail digests only feed the (fast) change detection, which is
+    // bypassed for append-only capture files - skip the extra 10 MiB of reads
+    // that would otherwise happen after every partial reindex.
+    if ( !klogg::isAppendOnlyFile( fileName_ ) ) {
+        file.reset();
+        QByteArray hashBuffer( IndexingBlockSize, Qt::Uninitialized );
+        const auto headerHashSize = file.read( hashBuffer.data(), hashBuffer.size() );
+        FileDigest fastHashDigest;
+        fastHashDigest.addData( hashBuffer.data(), static_cast<size_t>( headerHashSize ) );
 
-    scopedAccessor.setHeaderHash( fastHashDigest.digest(), headerHashSize );
+        scopedAccessor.setHeaderHash( fastHashDigest.digest(), headerHashSize );
 
-    if ( endFilePos <= hashBuffer.size() ) {
-        scopedAccessor.setTailHash( fastHashDigest.digest(), 0, headerHashSize );
-    }
-    else {
-        const auto tailHashOffset = endFilePos - hashBuffer.size();
-        file.seek( tailHashOffset );
-        const auto tailHashSize = file.read( hashBuffer.data(), hashBuffer.size() );
-        fastHashDigest.reset();
-        fastHashDigest.addData( hashBuffer.data(), static_cast<size_t>( tailHashSize ) );
-        scopedAccessor.setTailHash( fastHashDigest.digest(), tailHashOffset, tailHashSize );
+        if ( endFilePos <= hashBuffer.size() ) {
+            scopedAccessor.setTailHash( fastHashDigest.digest(), 0, headerHashSize );
+        }
+        else {
+            const auto tailHashOffset = endFilePos - hashBuffer.size();
+            file.seek( tailHashOffset );
+            const auto tailHashSize = file.read( hashBuffer.data(), hashBuffer.size() );
+            fastHashDigest.reset();
+            fastHashDigest.addData( hashBuffer.data(), static_cast<size_t>( tailHashSize ) );
+            scopedAccessor.setTailHash( fastHashDigest.digest(), tailHashOffset, tailHashSize );
+        }
     }
 
     const auto indexingEndTime = high_resolution_clock::now();
@@ -849,6 +893,16 @@ MonitoredFileStatus CheckFileChangesOperation::doCheckFileChanges()
     if ( realFileSize == 0 || realFileSize < indexedHash.size ) {
         LOG_INFO << "File truncated";
         return MonitoredFileStatus::Truncated;
+    }
+    else if ( klogg::isAppendOnlyFile( fileName_ ) ) {
+        // klogg is the writer and only ever appends: the size comparison above is
+        // sufficient, skip the O(file size) hash of the indexed prefix.
+        if ( realFileSize > indexedHash.size ) {
+            LOG_INFO << "New data on disk (append-only file)";
+            return MonitoredFileStatus::DataAdded;
+        }
+        LOG_INFO << "No change in file (append-only file)";
+        return MonitoredFileStatus::Unchanged;
     }
     else {
         QFile file( fileName_ );

@@ -59,6 +59,7 @@
 #include <QClipboard>
 #include <QCloseEvent>
 #include <QComboBox>
+#include <QDateTime>
 #include <QDir>
 #include <QDialogButtonBox>
 #include <QFile>
@@ -105,6 +106,7 @@
 #include "highlightersmenu.h"
 #include "issuereporter.h"
 #include "klogg_version.h"
+#include "logdataworker.h"
 #include "logger.h"
 #include "mainwindowtext.h"
 #include "openfilehelper.h"
@@ -746,13 +748,14 @@ void MainWindow::createActions()
     connect( adbOfflineMergeAction, &QAction::triggered, this,
              [ this ]( auto ) { this->mergeOpenFilesOffline(); } );
 
-    // Poll the camera provider PID every 3 seconds and mirror it in the F4 label.
+    // Poll the camera provider PID while a capture is running and mirror it in
+    // the F4 label. Each poll is two adb round-trips (ps + dumpsys media.camera)
+    // that compete with the logcat transport, so it is not run otherwise and the
+    // interval is kept generous (see updateCameraPolling).
     cameraPidTimer_ = new QTimer( this );
-    cameraPidTimer_->setInterval( 3000 );
+    cameraPidTimer_->setInterval( 10000 );
     connect( cameraPidTimer_, &QTimer::timeout, this,
              [ this ]() { this->updateCameraProviderPid(); } );
-    cameraPidTimer_->start();
-    updateCameraProviderPid();
 
     encodingGroup = new QActionGroup( this );
     connect( encodingGroup, &QActionGroup::triggered, this, &MainWindow::encodingChanged );
@@ -2423,16 +2426,34 @@ void MainWindow::generateDump()
     }
 }
 
-void MainWindow::cleanupAdbLogcatProcess()
+void MainWindow::stopProcessGracefully( QProcess* proc )
 {
-    if ( adbLogcatProcess_ == nullptr ) {
+    if ( proc == nullptr || proc->state() == QProcess::NotRunning ) {
         return;
     }
+    // SIGTERM lets the adb client flush whatever it has buffered for the
+    // capture file; only escalate to SIGKILL if it ignores us.
+    proc->terminate();
+    if ( !proc->waitForFinished( 1000 ) ) {
+        proc->kill();
+        proc->waitForFinished( 500 );
+    }
+}
 
-    adbLogcatProcess_->kill();
-    adbLogcatProcess_->waitForFinished( 500 );
-    adbLogcatProcess_->deleteLater();
-    adbLogcatProcess_ = nullptr;
+void MainWindow::cleanupAdbLogcatProcess()
+{
+    // Ending the session: no reconnect must follow whatever happens next.
+    adbLogcatSessionActive_ = false;
+    cancelAdbLogcatReconnect();
+
+    if ( adbLogcatProcess_ != nullptr ) {
+        // Detach the exit handler so a user-initiated stop is not mistaken for a
+        // crash.
+        adbLogcatProcess_->disconnect( this );
+        stopProcessGracefully( adbLogcatProcess_ );
+        adbLogcatProcess_->deleteLater();
+        adbLogcatProcess_ = nullptr;
+    }
 
     // Capture stopped - reset the tab color back to the default.
     mainTabWidget_.setTabColorForFile( adbLogcatFilePath_, QColor() );
@@ -2443,6 +2464,8 @@ void MainWindow::cleanupAdbLogcatProcess()
     if ( adbLogcatStopAction != nullptr ) {
         adbLogcatStopAction->setEnabled( false );
     }
+    updateAdbLogcatActionLabels();
+    updateCameraPolling();
 }
 
 void MainWindow::cleanupAdbKmsgProcess()
@@ -2451,18 +2474,19 @@ void MainWindow::cleanupAdbKmsgProcess()
         return;
     }
 
-    adbKmsgProcess_->kill();
-    adbKmsgProcess_->waitForFinished( 500 );
+    adbKmsgProcess_->disconnect( this );
+    stopProcessGracefully( adbKmsgProcess_ );
     adbKmsgProcess_->deleteLater();
     adbKmsgProcess_ = nullptr;
 
     // Capture stopped - reset the tab color back to the default.
     mainTabWidget_.setTabColorForFile( adbKmsgFilePath_, QColor() );
+    updateCameraPolling();
 }
 
 void MainWindow::stopAdbLogcat()
 {
-    if ( adbLogcatProcess_ == nullptr ) {
+    if ( !adbLogcatSessionActive_ ) {
         return;
     }
 
@@ -3037,16 +3061,18 @@ struct AdbSequenceContext {
     QString adbExecutable;
     std::vector<AdbStep> steps;
     std::function<void()> onSuccess;
+    std::function<void()> onFailure;
     size_t index = 0;
     QProcess* proc = nullptr;
     QTimer* watchdog = nullptr;
-    QProgressDialog* dialog = nullptr;
+    QProgressDialog* dialog = nullptr; // null when running in the background
     bool stepHandled = false; // guards finished-vs-watchdog double handling per step
     bool done = false;        // guards finishAdbSequence running more than once
 };
 
 void MainWindow::runAdbSequence( const QString& adbExecutable, const QString& busyLabel,
-                                 std::vector<AdbStep> steps, std::function<void()> onSuccess )
+                                 std::vector<AdbStep> steps, std::function<void()> onSuccess,
+                                 std::function<void()> onFailure, bool showBusyDialog )
 {
     if ( steps.empty() ) {
         if ( onSuccess ) {
@@ -3059,17 +3085,21 @@ void MainWindow::runAdbSequence( const QString& adbExecutable, const QString& bu
     ctx->adbExecutable = adbExecutable;
     ctx->steps = std::move( steps );
     ctx->onSuccess = std::move( onSuccess );
+    ctx->onFailure = std::move( onFailure );
     ctx->proc = new QProcess( this );
     ctx->watchdog = new QTimer( this );
     ctx->watchdog->setSingleShot( true );
 
     // Busy (0,0) modal dialog: keeps the UI painting/cancelable and blocks a second
-    // F1/F4/F6 trigger from starting an overlapping sequence.
-    ctx->dialog = new QProgressDialog( busyLabel, tr( "Cancel" ), 0, 0, this );
-    ctx->dialog->setWindowModality( Qt::ApplicationModal );
-    ctx->dialog->setMinimumDuration( 0 );
-    ctx->dialog->setAutoClose( false );
-    ctx->dialog->setAutoReset( false );
+    // F1/F4/F6 trigger from starting an overlapping sequence. Background sequences
+    // (capture reconnect) run without it so the user can keep working.
+    if ( showBusyDialog ) {
+        ctx->dialog = new QProgressDialog( busyLabel, tr( "Cancel" ), 0, 0, this );
+        ctx->dialog->setWindowModality( Qt::ApplicationModal );
+        ctx->dialog->setMinimumDuration( 0 );
+        ctx->dialog->setAutoClose( false );
+        ctx->dialog->setAutoReset( false );
+    }
 
     // A completed step: stop the watchdog, let validate() decide, then advance.
     const auto handleStep = [ this, ctx ]( bool timedOut ) {
@@ -3105,10 +3135,16 @@ void MainWindow::runAdbSequence( const QString& adbExecutable, const QString& bu
         }
         handleStep( true );
     } );
-    connect( ctx->dialog, &QProgressDialog::canceled, this,
-             [ this, ctx ]() { finishAdbSequence( ctx, false ); } );
+    if ( ctx->dialog ) {
+        connect( ctx->dialog, &QProgressDialog::canceled, this,
+                 [ this, ctx ]() { finishAdbSequence( ctx, false ); } );
+        ctx->dialog->show();
+    }
 
-    ctx->dialog->show();
+    if ( !showBusyDialog ) {
+        // Let the caller cancel a background sequence (see cancelAdbLogcatReconnect).
+        adbLogcatReconnectSequence_ = ctx;
+    }
     advanceAdbSequence( ctx );
 }
 
@@ -3146,21 +3182,33 @@ void MainWindow::finishAdbSequence( AdbSequenceContext* ctx, bool ok )
     }
     ctx->proc->deleteLater();
     ctx->watchdog->deleteLater();
-    ctx->dialog->deleteLater();
+    if ( ctx->dialog ) {
+        ctx->dialog->deleteLater();
+    }
+    if ( adbLogcatReconnectSequence_ == ctx ) {
+        adbLogcatReconnectSequence_ = nullptr;
+    }
 
     auto onSuccess = std::move( ctx->onSuccess );
+    auto onFailure = std::move( ctx->onFailure );
     delete ctx;
 
-    if ( ok && onSuccess ) {
-        onSuccess();
+    if ( ok ) {
+        if ( onSuccess ) {
+            onSuccess();
+        }
+    }
+    else if ( onFailure ) {
+        onFailure();
     }
 }
 
 void MainWindow::startAdbCapture( const QString& logPath, const QStringList& captureArgs,
                                   bool prepareLogcatBuffer, bool requireRoot, bool useKmsgSlot )
 {
-    // Use the separate F6 kernel-log slot or the F1/F2 logcat slot.
-    if ( ( useKmsgSlot ? adbKmsgProcess_ : adbLogcatProcess_ ) != nullptr ) {
+    // Use the separate F6 kernel-log slot or the F1/F2 logcat slot. The logcat
+    // slot counts as busy for the whole session, including while reconnecting.
+    if ( useKmsgSlot ? ( adbKmsgProcess_ != nullptr ) : adbLogcatSessionActive_ ) {
         return;
     }
 
@@ -3215,30 +3263,19 @@ void MainWindow::startAdbCapture( const QString& logPath, const QStringList& cap
     }
 
     if ( prepareLogcatBuffer ) {
-        // Increase device log buffer size before capturing (best-effort).
-        // Some buffers (e.g. kernel) may not be resizable on all devices, which makes
-        // adb return non-zero even when the other buffers were enlarged, so we don't
-        // treat a failure here as fatal - capture can still proceed.
-        auto bigBufferRejected = std::make_shared<bool>( false );
-        steps.push_back( { QStringList() << QStringLiteral( "logcat" ) << QStringLiteral( "-G" )
-                                         << QStringLiteral( "512M" ),
-                           15000,
-                           [ bigBufferRejected ]( QProcess& proc, bool timedOut ) {
-                               // exitStatus() matters as much as exitCode(): when the
-                               // process crashes or fails to start Qt reports exitCode 0
-                               // with a non-normal status, which would otherwise read as
-                               // success and skip the retry below.
-                               *bigBufferRejected = timedOut
-                                   || proc.exitStatus() != QProcess::NormalExit
-                                   || proc.exitCode() != 0;
+        appendLogcatBufferSteps( steps );
+        // Remember which boot we are capturing so a reconnect can tell "device
+        // rebooted" (ring buffer is fresh, dump it all) from "USB blipped" (ring
+        // still holds the gap, resume with -T).
+        steps.push_back( { QStringList() << QStringLiteral( "shell" )
+                                         << QStringLiteral( "cat /proc/sys/kernel/random/boot_id" ),
+                           10000, [ this ]( QProcess& proc, bool timedOut ) {
+                               adbBootId_ = timedOut
+                                                ? QString()
+                                                : QString::fromUtf8( proc.readAllStandardOutput() )
+                                                      .trimmed();
                                return true;
                            } } );
-        // Devices that refuse 512M (too little memory, per-buffer cap) often still
-        // accept a smaller size, so retry once at 256M. Also best-effort.
-        steps.push_back( { QStringList() << QStringLiteral( "logcat" ) << QStringLiteral( "-G" )
-                                         << QStringLiteral( "256M" ),
-                           15000, nullptr,
-                           [ bigBufferRejected ]() { return *bigBufferRejected; } } );
         // Clear device log buffer.
         steps.push_back(
             { QStringList() << QStringLiteral( "logcat" ) << QStringLiteral( "-c" ), 15000,
@@ -3257,12 +3294,10 @@ void MainWindow::startAdbCapture( const QString& logPath, const QStringList& cap
               } } );
     }
 
-    // The real capture: unchanged from the previous synchronous implementation,
-    // just relocated into the completion callback. adb output is written straight
-    // to the file by the kernel (no Qt event loop per line); the tab follows it.
+    // The real capture: adb output is written straight to the file by the kernel
+    // (no Qt event loop per line); the tab follows it.
     auto onSuccess = [ this, adbExecutable, logPath, captureArgs, useKmsgSlot, previousSearchText,
                        previousColorLabels ]() {
-        QProcess*& proc = useKmsgSlot ? adbKmsgProcess_ : adbLogcatProcess_;
         QString& filePathRef = useKmsgSlot ? adbKmsgFilePath_ : adbLogcatFilePath_;
 
         // If the file is already open in a tab, close that tab first.
@@ -3275,15 +3310,25 @@ void MainWindow::startAdbCapture( const QString& logPath, const QStringList& cap
         }
 
         filePathRef = logPath;
+        adbExecutable_ = adbExecutable;
+        if ( useKmsgSlot ) {
+            adbKmsgArgs_ = captureArgs;
+        }
+        else {
+            adbLogcatArgs_ = captureArgs;
+            adbLogcatSessionActive_ = true;
+            adbLogcatReconnectAttempts_ = 0;
+        }
 
-        // Start adb process - write directly to file via kernel (no Qt event loop bottleneck)
-        proc = new QProcess( this );
-        proc->setStandardOutputFile( logPath, QIODevice::Truncate );
-        proc->start( adbExecutable, adbArgs( captureArgs ) );
-        if ( !proc->waitForStarted( 5000 ) ) {
+        // Only klogg writes to this file, and only by appending: let the indexer
+        // skip the per-notification full-file hash (see logdataworker.cpp).
+        klogg::markAppendOnlyFile( logPath );
+
+        if ( !spawnAdbCaptureProcess( useKmsgSlot, /*append=*/false ) ) {
             QMessageBox::critical( this, tr( "klogg" ), tr( "Could not start adb capture." ) );
-            proc->deleteLater();
-            proc = nullptr;
+            if ( !useKmsgSlot ) {
+                adbLogcatSessionActive_ = false;
+            }
             return;
         }
 
@@ -3316,12 +3361,310 @@ void MainWindow::startAdbCapture( const QString& logPath, const QStringList& cap
         if ( !useKmsgSlot ) {
             adbLogcatStartAction->setEnabled( false );
             adbLogcatStopAction->setEnabled( true );
+            updateAdbLogcatActionLabels();
         }
+        updateCameraPolling();
     };
 
     // Run the prep sequence (may be empty, in which case onSuccess fires immediately).
     runAdbSequence( adbExecutable, tr( "Preparing adb capture..." ), std::move( steps ),
                     std::move( onSuccess ) );
+}
+
+void MainWindow::appendLogcatBufferSteps( std::vector<AdbStep>& steps )
+{
+    // Increase device log buffer size before capturing (best-effort).
+    // Some buffers (e.g. kernel) may not be resizable on all devices, which makes
+    // adb return non-zero even when the other buffers were enlarged, so we don't
+    // treat a failure here as fatal - capture can still proceed.
+    auto bigBufferRejected = std::make_shared<bool>( false );
+    steps.push_back( { QStringList() << QStringLiteral( "logcat" ) << QStringLiteral( "-G" )
+                                     << QStringLiteral( "512M" ),
+                       15000,
+                       [ bigBufferRejected ]( QProcess& proc, bool timedOut ) {
+                           // exitStatus() matters as much as exitCode(): when the
+                           // process crashes or fails to start Qt reports exitCode 0
+                           // with a non-normal status, which would otherwise read as
+                           // success and skip the retry below.
+                           *bigBufferRejected = timedOut
+                               || proc.exitStatus() != QProcess::NormalExit
+                               || proc.exitCode() != 0;
+                           return true;
+                       } } );
+    // Devices that refuse 512M (too little memory, per-buffer cap) often still
+    // accept a smaller size, so fall back to 256M. Also best-effort.
+    steps.push_back( { QStringList() << QStringLiteral( "logcat" ) << QStringLiteral( "-G" )
+                                     << QStringLiteral( "256M" ),
+                       15000, nullptr, [ bigBufferRejected ]() { return *bigBufferRejected; } } );
+    // Read back what logd actually ended up with. A rejected -G is silent from the
+    // capture's point of view but means the device ring is tiny and will overwrite
+    // itself under load, so surface the real size in the Stop action label.
+    steps.push_back( { QStringList() << QStringLiteral( "logcat" ) << QStringLiteral( "-g" ), 10000,
+                       [ this ]( QProcess& proc, bool timedOut ) {
+                           adbLogcatBufferInfo_.clear();
+                           if ( !timedOut ) {
+                               // Lines look like:
+                               //   main: ring buffer is 512 MiB (1 MiB consumed), max entry is 5120 B
+                               const auto out = QString::fromUtf8( proc.readAllStandardOutput() );
+                               const QRegularExpression re(
+                                   QStringLiteral( R"(^\s*(\w+):\s*ring buffer is\s+(\d+)\s*(\w+))" ),
+                                   QRegularExpression::MultilineOption );
+                               auto it = re.globalMatch( out );
+                               QStringList parts;
+                               QSet<QString> distinctSizes;
+                               while ( it.hasNext() ) {
+                                   const auto m = it.next();
+                                   const QString size
+                                       = m.captured( 2 ) + m.captured( 3 ).left( 1 ).toUpper();
+                                   distinctSizes.insert( size );
+                                   parts << QStringLiteral( "%1=%2" ).arg( m.captured( 1 ), size );
+                               }
+                               // "buf=512M" when every buffer agrees, else list them.
+                               if ( distinctSizes.size() == 1 ) {
+                                   adbLogcatBufferInfo_
+                                       = QStringLiteral( "buf=" ) + *distinctSizes.begin();
+                               }
+                               else {
+                                   adbLogcatBufferInfo_ = parts.join( QLatin1Char( ' ' ) );
+                               }
+                           }
+                           // Informational only, never block the capture on it.
+                           return true;
+                       } } );
+}
+
+bool MainWindow::spawnAdbCaptureProcess( bool useKmsgSlot, bool append,
+                                         bool resumeFromLastTimestamp )
+{
+    QProcess*& proc = useKmsgSlot ? adbKmsgProcess_ : adbLogcatProcess_;
+    const QString& logPath = useKmsgSlot ? adbKmsgFilePath_ : adbLogcatFilePath_;
+    QStringList args = useKmsgSlot ? adbKmsgArgs_ : adbLogcatArgs_;
+
+    if ( proc != nullptr ) {
+        return false;
+    }
+
+    if ( append && !useKmsgSlot ) {
+        QString since;
+        if ( resumeFromLastTimestamp ) {
+            // Same boot: logd still holds everything since the last `-c`, so ask
+            // only for entries newer than the last line we have. That refills the
+            // gap without re-dumping the whole ring into the file.
+            since = lastLogcatTimestamp( logPath );
+            if ( !since.isEmpty() ) {
+                args << QStringLiteral( "-T" ) << since;
+            }
+        }
+
+        // Leave a visible marker so a gap in the file can be told from a lull.
+        QFile marker( logPath );
+        if ( marker.open( QIODevice::WriteOnly | QIODevice::Append ) ) {
+            marker.write( QStringLiteral( "--------- klogg: adb capture reconnected at %1 "
+                                          "(attempt %2, %3) ---------\n" )
+                              .arg( QDateTime::currentDateTime().toString( Qt::ISODate ) )
+                              .arg( adbLogcatReconnectAttempts_ )
+                              .arg( since.isEmpty() ? QStringLiteral( "full ring dump" )
+                                                    : QStringLiteral( "resumed from " ) + since )
+                              .toUtf8() );
+        }
+    }
+
+    // Start adb process - write directly to file via kernel (no Qt event loop bottleneck)
+    proc = new QProcess( this );
+    proc->setStandardOutputFile( logPath, append ? QIODevice::Append : QIODevice::Truncate );
+    // Nothing reads stderr; make sure it cannot accumulate in QProcess' buffer.
+    proc->setStandardErrorFile( QProcess::nullDevice() );
+    connect( proc,
+             static_cast<void ( QProcess::* )( int, QProcess::ExitStatus )>( &QProcess::finished ),
+             this, [ this, useKmsgSlot ]( int exitCode, QProcess::ExitStatus status ) {
+                 onAdbCaptureExited( useKmsgSlot, exitCode, status );
+             } );
+    connect( proc, &QProcess::errorOccurred, this,
+             [ this, useKmsgSlot ]( QProcess::ProcessError error ) {
+                 // finished() does not fire for FailedToStart; everything else is
+                 // followed by finished() and handled there.
+                 if ( error == QProcess::FailedToStart ) {
+                     onAdbCaptureExited( useKmsgSlot, -1, QProcess::CrashExit );
+                 }
+             } );
+    proc->start( adbExecutable_, adbArgs( args ) );
+    if ( !proc->waitForStarted( 5000 ) ) {
+        proc->disconnect( this );
+        proc->deleteLater();
+        proc = nullptr;
+        return false;
+    }
+    return true;
+}
+
+void MainWindow::onAdbCaptureExited( bool useKmsgSlot, int exitCode, QProcess::ExitStatus status )
+{
+    QProcess*& proc = useKmsgSlot ? adbKmsgProcess_ : adbLogcatProcess_;
+    const QString& logPath = useKmsgSlot ? adbKmsgFilePath_ : adbLogcatFilePath_;
+
+    LOG_WARNING << "adb capture process exited unexpectedly, kmsg=" << useKmsgSlot
+                << " code=" << exitCode << " status=" << static_cast<int>( status );
+
+    if ( proc != nullptr ) {
+        proc->disconnect( this );
+        proc->deleteLater();
+        proc = nullptr;
+    }
+
+    // Red tab: the file is open but nothing is being written to it any more.
+    mainTabWidget_.setTabColorForFile( logPath, QColor( 0xe5, 0x39, 0x35 ) );
+    // No point polling the camera PID on a device that is not there.
+    updateCameraPolling();
+
+    if ( useKmsgSlot ) {
+        // Kernel-log capture needs adb root again and `cat /dev/kmsg` would re-dump
+        // the whole ring on restart, so just report it and let the user re-trigger F6.
+        return;
+    }
+
+    if ( !adbLogcatSessionActive_ ) {
+        return;
+    }
+    adbLogcatReconnecting_ = true;
+    updateAdbLogcatActionLabels();
+    // A short pause avoids hammering adb if it is flapping.
+    scheduleAdbLogcatReconnect( 1000 );
+}
+
+void MainWindow::scheduleAdbLogcatReconnect( int delayMs )
+{
+    if ( !adbLogcatSessionActive_ ) {
+        return;
+    }
+    if ( adbLogcatReconnectTimer_ == nullptr ) {
+        adbLogcatReconnectTimer_ = new QTimer( this );
+        adbLogcatReconnectTimer_->setSingleShot( true );
+        connect( adbLogcatReconnectTimer_, &QTimer::timeout, this, [ this ]() {
+            if ( !adbLogcatSessionActive_ || adbLogcatProcess_ != nullptr
+                 || adbLogcatReconnectSequence_ != nullptr ) {
+                return;
+            }
+            ++adbLogcatReconnectAttempts_;
+            updateAdbLogcatActionLabels();
+
+            std::vector<AdbStep> steps;
+            // Block until the device is visible again. Long timeout, but on expiry
+            // we simply go around again so a device that stays away for an hour
+            // still gets picked up.
+            steps.push_back( { QStringList() << QStringLiteral( "wait-for-device" ), 30000,
+                               []( QProcess&, bool timedOut ) { return !timedOut; } } );
+            // The device may have rebooted, which resets logd's ring size.
+            appendLogcatBufferSteps( steps );
+            // Did it reboot? Decides between resuming with -T and a full ring dump.
+            auto bootId = std::make_shared<QString>();
+            steps.push_back( { QStringList() << QStringLiteral( "shell" )
+                                             << QStringLiteral(
+                                                    "cat /proc/sys/kernel/random/boot_id" ),
+                               10000, [ bootId ]( QProcess& proc, bool timedOut ) {
+                                   *bootId = timedOut ? QString()
+                                                      : QString::fromUtf8(
+                                                            proc.readAllStandardOutput() )
+                                                            .trimmed();
+                                   return true;
+                               } } );
+
+            runAdbSequence(
+                adbExecutable_, QString(), std::move( steps ),
+                [ this, bootId ]() {
+                    if ( !adbLogcatSessionActive_ || adbLogcatProcess_ != nullptr ) {
+                        return;
+                    }
+                    // Unknown boot id: assume the worst (reboot) and dump everything
+                    // rather than risk skipping entries with -T.
+                    const bool sameBoot = !bootId->isEmpty() && *bootId == adbBootId_;
+                    adbBootId_ = *bootId;
+                    if ( spawnAdbCaptureProcess( /*useKmsgSlot=*/false, /*append=*/true,
+                                                 /*resumeFromLastTimestamp=*/sameBoot ) ) {
+                        adbLogcatReconnecting_ = false;
+                        mainTabWidget_.setTabColorForFile( adbLogcatFilePath_,
+                                                           QColor( 0x4c, 0xaf, 0x50 ) );
+                        updateAdbLogcatActionLabels();
+                        updateCameraPolling();
+                    }
+                    else {
+                        scheduleAdbLogcatReconnect( 2000 );
+                    }
+                },
+                [ this ]() { scheduleAdbLogcatReconnect( 2000 ); },
+                /*showBusyDialog=*/false );
+        } );
+    }
+    adbLogcatReconnectTimer_->start( delayMs );
+}
+
+void MainWindow::cancelAdbLogcatReconnect()
+{
+    adbLogcatReconnecting_ = false;
+    if ( adbLogcatReconnectTimer_ != nullptr ) {
+        adbLogcatReconnectTimer_->stop();
+    }
+    if ( adbLogcatReconnectSequence_ != nullptr ) {
+        // Drop the callbacks first so the sequence cannot re-arm the timer.
+        adbLogcatReconnectSequence_->onSuccess = nullptr;
+        adbLogcatReconnectSequence_->onFailure = nullptr;
+        finishAdbSequence( adbLogcatReconnectSequence_, false );
+        adbLogcatReconnectSequence_ = nullptr;
+    }
+}
+
+void MainWindow::updateAdbLogcatActionLabels()
+{
+    if ( adbLogcatStopAction == nullptr ) {
+        return;
+    }
+    QString label = tr( klogg::mainwindow::action::adbLogcatStopText );
+    if ( adbLogcatSessionActive_ ) {
+        QStringList extra;
+        if ( adbLogcatReconnecting_ ) {
+            extra << tr( "device lost, reconnecting #%1" ).arg( adbLogcatReconnectAttempts_ );
+        }
+        else if ( adbLogcatReconnectAttempts_ > 0 ) {
+            extra << tr( "reconnected x%1" ).arg( adbLogcatReconnectAttempts_ );
+        }
+        if ( !adbLogcatBufferInfo_.isEmpty() ) {
+            extra << adbLogcatBufferInfo_;
+        }
+        if ( !extra.isEmpty() ) {
+            label += QStringLiteral( " [%1]" ).arg( extra.join( QStringLiteral( ", " ) ) );
+        }
+    }
+    adbLogcatStopAction->setText( label );
+}
+
+QString MainWindow::lastLogcatTimestamp( const QString& filePath )
+{
+    QFile file( filePath );
+    if ( !file.open( QIODevice::ReadOnly ) ) {
+        return QString();
+    }
+    const qint64 size = file.size();
+    const qint64 window = std::min<qint64>( size, 64 * 1024 );
+    if ( window <= 0 ) {
+        return QString();
+    }
+    file.seek( size - window );
+    const QByteArray tail = file.read( window );
+
+    // Walk complete lines from the end; the very last one may have been cut
+    // mid-write when adb died, so require a trailing '\n'.
+    const QRegularExpression re(
+        QStringLiteral( R"(^(\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}))" ) );
+    int end = tail.lastIndexOf( '\n' );
+    while ( end > 0 ) {
+        const int start = tail.lastIndexOf( '\n', end - 1 ) + 1;
+        const QString line = QString::fromUtf8( tail.constData() + start, end - start );
+        const auto m = re.match( line );
+        if ( m.hasMatch() ) {
+            return m.captured( 1 );
+        }
+        end = start - 1;
+    }
+    return QString();
 }
 
 void MainWindow::quickSaveAdbLogcat()
@@ -3450,6 +3793,23 @@ void MainWindow::killCameraAdb()
     // The kill just changed the process table; refresh the F4 label right away.
     runAdbSequence( adbExecutable, tr( "Killing camera processes..." ), std::move( steps ),
                     [ this ]() { updateCameraProviderPid(); } );
+}
+
+void MainWindow::updateCameraPolling()
+{
+    if ( cameraPidTimer_ == nullptr ) {
+        return;
+    }
+    const bool capturing = adbLogcatProcess_ != nullptr || adbKmsgProcess_ != nullptr;
+    if ( capturing ) {
+        if ( !cameraPidTimer_->isActive() ) {
+            cameraPidTimer_->start();
+            updateCameraProviderPid();
+        }
+    }
+    else {
+        cameraPidTimer_->stop();
+    }
 }
 
 void MainWindow::updateCameraProviderPid()

@@ -41,6 +41,7 @@
 
 #include <QMainWindow>
 #include <QMenu>
+#include <QProcess>
 #include <QSystemTrayIcon>
 #include <QTemporaryDir>
 
@@ -273,10 +274,46 @@ class MainWindow : public QMainWindow {
     // proceed; onSuccess() runs only if every step succeeds and the user does not
     // cancel. See AdbStep in mainwindow.cpp.
     void runAdbSequence( const QString& adbExecutable, const QString& busyLabel,
-                         std::vector<AdbStep> steps, std::function<void()> onSuccess );
+                         std::vector<AdbStep> steps, std::function<void()> onSuccess,
+                         std::function<void()> onFailure = nullptr, bool showBusyDialog = true );
     // Internal helpers driving runAdbSequence's state machine over a heap context.
     void advanceAdbSequence( AdbSequenceContext* ctx );
     void finishAdbSequence( AdbSequenceContext* ctx, bool ok );
+    // Spawn the long-running `adb <args>` capture process into the given slot,
+    // writing stdout straight to the slot's file (truncating or appending), and
+    // hook its exit so an unexpected death is detected (see onAdbCaptureExited).
+    // When resumeFromLastTimestamp is set (logcat slot, same boot) the capture
+    // starts with `-T <last timestamp in file>` so only the gap is refilled.
+    // Returns false if the process could not be started.
+    bool spawnAdbCaptureProcess( bool useKmsgSlot, bool append,
+                                 bool resumeFromLastTimestamp = false );
+    // Handler for the capture process dying on its own (device unplugged, adb
+    // server restarted, ...). Marks the tab red and, for the F1 logcat slot,
+    // kicks off the reconnect loop so the capture resumes once the device is back.
+    void onAdbCaptureExited( bool useKmsgSlot, int exitCode, QProcess::ExitStatus status );
+    // Wait for the device to come back (adb wait-for-device) then restart the
+    // logcat capture in append mode, resuming from the last captured timestamp
+    // via `logcat -T` so the gap is refilled from the device ring buffer without
+    // re-dumping everything. Retries until it succeeds or the user presses F2.
+    void scheduleAdbLogcatReconnect( int delayMs );
+    void cancelAdbLogcatReconnect();
+    // Build the logcat -G steps (512M, then 256M if that was rejected) followed
+    // by a `logcat -g` read-back that records the effective size in
+    // adbLogcatBufferInfo_ and reflects it in the Stop action label.
+    void appendLogcatBufferSteps( std::vector<AdbStep>& steps );
+    // Reflect capture state (running / reconnecting / buffer size) in the menu
+    // bar action labels so the user can see it without opening anything.
+    void updateAdbLogcatActionLabels();
+    // Start/stop the camera PID poll depending on whether a capture is running:
+    // the poll costs two adb round-trips (ps + dumpsys media.camera) and is only
+    // useful while logs are being captured.
+    void updateCameraPolling();
+    // Ask the process to exit cleanly first so adb can flush its last buffered
+    // writes to the capture file, only SIGKILL if it does not comply in time.
+    static void stopProcessGracefully( QProcess* proc );
+    // Timestamp "MM-DD HH:MM:SS.mmm" of the last complete threadtime line in the
+    // file, or empty if none could be parsed.
+    static QString lastLogcatTimestamp( const QString& filePath );
     // Convert a raw /dev/kmsg capture at srcPath into logcat threadtime format at
     // dstPath using the given boot time. Returns false on I/O error.
     bool convertKmsgFile( const QString& srcPath, const QString& dstPath, double bootEpochSec,
@@ -390,6 +427,23 @@ class MainWindow : public QMainWindow {
     // Serial of the device chosen when multiple are attached; empty means "use
     // the single/default device" (no `-s` flag). See ensureAdbDevice/adbArgs.
     QString adbSerial_;
+
+    // Capture session state. The session outlives the adb process: while the
+    // device is away the process is gone but the session (and the Stop action)
+    // stays active and a reconnect is pending.
+    QString adbExecutable_;
+    QStringList adbLogcatArgs_;
+    QStringList adbKmsgArgs_;
+    bool adbLogcatSessionActive_ = false;
+    bool adbLogcatReconnecting_ = false;
+    int adbLogcatReconnectAttempts_ = 0;
+    QTimer* adbLogcatReconnectTimer_ = nullptr;
+    AdbSequenceContext* adbLogcatReconnectSequence_ = nullptr;
+    // Effective device log buffer size as reported by `logcat -g` (e.g. "512M"),
+    // empty if unknown.
+    QString adbLogcatBufferInfo_;
+    // /proc/sys/kernel/random/boot_id of the device when the capture (re)started.
+    QString adbBootId_;
 
     QProcess* cameraPidProcess_ = nullptr;
     QProcess* cameraDeviceProcess_ = nullptr;

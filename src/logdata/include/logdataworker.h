@@ -62,6 +62,17 @@
 #include "linepositionarray.h"
 #include "loadingstatus.h"
 
+// Registry of files that klogg itself is appending to (adb captures). Such files
+// only ever grow, so the change detection can trust the file size alone instead of
+// re-reading and hashing the whole indexed prefix on every notification - that
+// hash is O(file size) and would otherwise be paid every ~250 ms while a capture
+// runs, starving the single indexing thread as the capture file gets large.
+namespace klogg {
+void markAppendOnlyFile( const QString& fileName );
+void unmarkAppendOnlyFile( const QString& fileName );
+bool isAppendOnlyFile( const QString& fileName );
+} // namespace klogg
+
 struct IndexedHash {
     qint64 size = 0;
     quint64 fullDigest = 0;
