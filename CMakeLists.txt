@@ -94,6 +94,15 @@ include(prepare_version)
 include(FindPkgConfig)
 include(GNUInstallDirs)
 
+# CMake < 3.26 drives GCC LTO with a bare "-flto", which makes the final link
+# single-threaded (~75 s for klogg on a 32-core box). "-flto=auto" lets GCC
+# fan the LTO partitions out over all cores (or the make jobserver) and cuts
+# that to ~10 s with identical output.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND NOT CMAKE_CXX_COMPILER_VERSION VERSION_LESS 10)
+  set(CMAKE_CXX_COMPILE_OPTIONS_IPO "-flto=auto" "-fno-fat-lto-objects")
+  set(CMAKE_C_COMPILE_OPTIONS_IPO "-flto=auto" "-fno-fat-lto-objects")
+endif()
+
 if(MSVC)
   if(CMAKE_CXX_FLAGS MATCHES "/W[0-4]")
     string(

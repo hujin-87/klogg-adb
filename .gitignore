@@ -33,6 +33,7 @@ object_script.glogg.Release
 
 
 build_root/
+build_dev/
 build_root_clang/
 build_root_gcc/
 build_root_qt5/

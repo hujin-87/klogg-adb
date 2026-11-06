@@ -8,7 +8,8 @@
 #
 # 用法:
 #   ./my_make.sh              # 全部: 编译 + deb + exe
-#   ./my_make.sh bin          # 只编译 klogg 可执行文件 (最快)
+#   ./my_make.sh bin          # 只编译 klogg 可执行文件 (带 LTO, 和 deb 一致)
+#   ./my_make.sh dev          # 开发用: 不开 LTO, 改一个文件后重编最快 (~10s)
 #   ./my_make.sh build        # 只编译 Linux (全部 target)
 #   ./my_make.sh deb          # 编译 Linux + 打 deb
 #   ./my_make.sh exe          # 只交叉编译 Windows exe/zip
@@ -18,10 +19,16 @@
 #   JOBS=24                   # 并行度 (默认 24)
 #   BUILD_TYPE=RelWithDebInfo # cmake 构建类型
 #
+# 编译速度相关 (首次配置时生效; 已有 build 目录不会自动切换):
+#   - 有 ninja 就用 Ninja 生成器, 有 ccache 就启用 ccache
+#   - 链接阶段 LTO 用 -flto=auto 并行 (CMakeLists.txt), 76s -> ~11s
+#   - dev 目标用独立的 build_dev/ 目录且关闭 LTO, 链接只要几秒
+#
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="$REPO/build_root"
+DEV_BUILD_DIR="$REPO/build_dev"
 OUTPUT_DIR="$REPO/output"
 JOBS="${JOBS:-24}"
 BUILD_TYPE="${BUILD_TYPE:-RelWithDebInfo}"
@@ -29,6 +36,22 @@ BUILD_TYPE="${BUILD_TYPE:-RelWithDebInfo}"
 TARGET="${1:-all}"
 
 log() { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
+
+# cmake 配置参数: 自动用上 ninja / ccache (都可选)
+configure_args() {
+  local -a args=( -DCMAKE_BUILD_TYPE="$BUILD_TYPE" )
+  # 显式指定系统编译器, 避免 PATH 里的同名杂物 (如 ~/bin/cc) 被当成编译器
+  if [ -x /usr/bin/cc ] && [ -x /usr/bin/c++ ]; then
+    args+=( -DCMAKE_C_COMPILER=/usr/bin/cc -DCMAKE_CXX_COMPILER=/usr/bin/c++ )
+  fi
+  if command -v ninja >/dev/null 2>&1; then
+    args+=( -G Ninja )
+  fi
+  if command -v ccache >/dev/null 2>&1; then
+    args+=( -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache )
+  fi
+  printf '%s\n' "${args[@]}"
+}
 
 usage() {
   cat <<'EOF'
@@ -38,7 +61,8 @@ usage() {
   ./my_make.sh [目标]
 
 目标:
-  bin          只编译 klogg 可执行文件 (最快, 产物 build_root/output/klogg)
+  bin          只编译 klogg 可执行文件 (带 LTO, 产物 build_root/output/klogg)
+  dev          开发用快速编译, 关闭 LTO (产物 build_dev/output/klogg)
   build        只编译 Linux (全部 target)
   deb          编译 Linux + 打 .deb
   exe          只交叉编译 Windows exe/zip
@@ -54,6 +78,7 @@ usage() {
 
 示例:
   ./my_make.sh              # 全部
+  ./my_make.sh dev          # 改代码后快速验证
   JOBS=32 ./my_make.sh deb  # 32 线程编译并打 deb
 EOF
 }
@@ -64,7 +89,8 @@ EOF
 do_build() {
   if [ ! -f "$BUILD_DIR/CMakeCache.txt" ]; then
     log "[配置] cmake -DCMAKE_BUILD_TYPE=$BUILD_TYPE"
-    cmake -DCMAKE_BUILD_TYPE="$BUILD_TYPE" -S "$REPO" -B "$BUILD_DIR"
+    mapfile -t cfg < <(configure_args)
+    cmake "${cfg[@]}" -S "$REPO" -B "$BUILD_DIR"
   fi
   log "[编译] cmake --build -j$JOBS"
   cmake --build "$BUILD_DIR" -j"$JOBS"
@@ -72,16 +98,32 @@ do_build() {
 }
 
 # ---------------------------------------------------------------------------
-# 1b) 只编译 klogg 可执行文件 (最快, 只 link 主程序)
+# 1b) 只编译 klogg 可执行文件 (只 link 主程序)
 # ---------------------------------------------------------------------------
 do_bin() {
   if [ ! -f "$BUILD_DIR/CMakeCache.txt" ]; then
     log "[配置] cmake -DCMAKE_BUILD_TYPE=$BUILD_TYPE"
-    cmake -DCMAKE_BUILD_TYPE="$BUILD_TYPE" -S "$REPO" -B "$BUILD_DIR"
+    mapfile -t cfg < <(configure_args)
+    cmake "${cfg[@]}" -S "$REPO" -B "$BUILD_DIR"
   fi
   log "[编译] cmake --build --target klogg -j$JOBS"
   cmake --build "$BUILD_DIR" --target klogg -j"$JOBS"
   log "产物: $BUILD_DIR/output/klogg"
+}
+
+# ---------------------------------------------------------------------------
+# 1c) 开发用快速编译: 独立目录, 关 LTO, 不编测试
+# ---------------------------------------------------------------------------
+do_dev() {
+  if [ ! -f "$DEV_BUILD_DIR/CMakeCache.txt" ]; then
+    log "[配置] cmake (dev, LTO off) -DCMAKE_BUILD_TYPE=$BUILD_TYPE"
+    mapfile -t cfg < <(configure_args)
+    cmake "${cfg[@]}" -DKLOGG_USE_LTO=OFF -DKLOGG_BUILD_TESTS=OFF \
+      -S "$REPO" -B "$DEV_BUILD_DIR"
+  fi
+  log "[编译] cmake --build --target klogg -j$JOBS (dev)"
+  cmake --build "$DEV_BUILD_DIR" --target klogg -j"$JOBS"
+  log "产物: $DEV_BUILD_DIR/output/klogg"
 }
 
 # ---------------------------------------------------------------------------
@@ -133,13 +175,14 @@ open_output() {
 case "$TARGET" in
   -h|--help|help) usage; exit 0 ;;
   bin)   do_bin ;;
+  dev)   do_dev ;;
   build) do_build ;;
   deb)   do_build; do_deb; open_output ;;
   exe)   do_exe; open_output ;;
   all)   do_build; do_deb; do_exe; open_output ;;
   *)
     echo "未知参数: $TARGET" >&2
-    echo "用法: $0 [bin|build|deb|exe|all]" >&2
+    echo "用法: $0 [bin|dev|build|deb|exe|all]" >&2
     exit 1
     ;;
 esac
