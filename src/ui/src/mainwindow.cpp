@@ -3341,8 +3341,7 @@ void MainWindow::startAdbCapture( const QString& logPath, const QStringList& cap
     if ( prepareLogcatBuffer ) {
         appendLogcatBufferSteps( steps );
         // Remember which boot we are capturing so a reconnect can tell "device
-        // rebooted" (ring buffer is fresh, dump it all) from "USB blipped" (ring
-        // still holds the gap, resume with -T).
+        // rebooted" (logd ring size reset, re-apply -G) from "USB blipped".
         steps.push_back( { QStringList() << QStringLiteral( "shell" )
                                          << QStringLiteral( "cat /proc/sys/kernel/random/boot_id" ),
                            10000, [ this ]( QProcess& proc, bool timedOut ) {
@@ -3514,8 +3513,7 @@ void MainWindow::appendLogcatBufferSteps( std::vector<AdbStep>& steps,
                        onlyIf } );
 }
 
-bool MainWindow::spawnAdbCaptureProcess( bool useKmsgSlot, bool append,
-                                         bool resumeFromLastTimestamp )
+bool MainWindow::spawnAdbCaptureProcess( bool useKmsgSlot, bool append )
 {
     QProcess*& proc = useKmsgSlot ? adbKmsgProcess_ : adbLogcatProcess_;
     const QString& logPath = useKmsgSlot ? adbKmsgFilePath_ : adbLogcatFilePath_;
@@ -3526,26 +3524,20 @@ bool MainWindow::spawnAdbCaptureProcess( bool useKmsgSlot, bool append,
     }
 
     if ( append && !useKmsgSlot ) {
-        QString since;
-        if ( resumeFromLastTimestamp ) {
-            // Same boot: logd still holds everything since the last `-c`, so ask
-            // only for entries newer than the last line we have. That refills the
-            // gap without re-dumping the whole ring into the file.
-            since = lastLogcatTimestamp( logPath );
-            if ( !since.isEmpty() ) {
-                args << QStringLiteral( "-T" ) << since;
-            }
-        }
+        // Reconnect: live output only. A plain `logcat` would first dump the whole
+        // device ring (everything since the `-c` at F1, or since boot after a
+        // reboot) into the file; `-T 1` replays just the most recent line and then
+        // streams. Whatever happened while the device was away is not wanted here.
+        args << QStringLiteral( "-T" ) << QStringLiteral( "1" );
 
-        // Leave a visible marker so a gap in the file can be told from a lull.
+        // Leave a visible marker so the gap in the file can be told from a lull.
         QFile marker( logPath );
         if ( marker.open( QIODevice::WriteOnly | QIODevice::Append ) ) {
             marker.write( QStringLiteral( "--------- klogg: adb capture reconnected at %1 "
-                                          "(attempt %2, %3) ---------\n" )
+                                          "(attempt %2, logs while disconnected skipped) "
+                                          "---------\n" )
                               .arg( QDateTime::currentDateTime().toString( Qt::ISODate ) )
                               .arg( adbLogcatReconnectAttempts_ )
-                              .arg( since.isEmpty() ? QStringLiteral( "full ring dump" )
-                                                    : QStringLiteral( "resumed from " ) + since )
                               .toUtf8() );
         }
     }
@@ -3634,8 +3626,8 @@ void MainWindow::scheduleAdbLogcatReconnect( int delayMs )
             // still gets picked up.
             steps.push_back( { QStringList() << QStringLiteral( "wait-for-device" ), 30000,
                                []( QProcess&, bool timedOut ) { return !timedOut; } } );
-            // Did it reboot? Decides between resuming with -T and a full ring dump,
-            // and whether the ring size needs to be re-applied at all.
+            // Did it reboot? A reboot resets logd's ring size, so only then are the
+            // resize steps worth their round-trips.
             auto bootId = std::make_shared<QString>();
             steps.push_back( { QStringList() << QStringLiteral( "shell" )
                                              << QStringLiteral(
@@ -3660,12 +3652,8 @@ void MainWindow::scheduleAdbLogcatReconnect( int delayMs )
                     if ( !adbLogcatSessionActive_ || adbLogcatProcess_ != nullptr ) {
                         return;
                     }
-                    // Unknown boot id: assume the worst (reboot) and dump everything
-                    // rather than risk skipping entries with -T.
-                    const bool sameBoot = !bootId->isEmpty() && *bootId == adbBootId_;
                     adbBootId_ = *bootId;
-                    if ( spawnAdbCaptureProcess( /*useKmsgSlot=*/false, /*append=*/true,
-                                                 /*resumeFromLastTimestamp=*/sameBoot ) ) {
+                    if ( spawnAdbCaptureProcess( /*useKmsgSlot=*/false, /*append=*/true ) ) {
                         adbLogcatReconnecting_ = false;
                         mainTabWidget_.setTabColorForFile( adbLogcatFilePath_,
                                                            QColor( 0x4c, 0xaf, 0x50 ) );
@@ -3720,37 +3708,6 @@ void MainWindow::updateAdbLogcatActionLabels()
         }
     }
     adbLogcatStopAction->setText( label );
-}
-
-QString MainWindow::lastLogcatTimestamp( const QString& filePath )
-{
-    QFile file( filePath );
-    if ( !file.open( QIODevice::ReadOnly ) ) {
-        return QString();
-    }
-    const qint64 size = file.size();
-    const qint64 window = std::min<qint64>( size, 64 * 1024 );
-    if ( window <= 0 ) {
-        return QString();
-    }
-    file.seek( size - window );
-    const QByteArray tail = file.read( window );
-
-    // Walk complete lines from the end; the very last one may have been cut
-    // mid-write when adb died, so require a trailing '\n'.
-    const QRegularExpression re(
-        QStringLiteral( R"(^(\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}))" ) );
-    int end = tail.lastIndexOf( '\n' );
-    while ( end > 0 ) {
-        const int start = tail.lastIndexOf( '\n', end - 1 ) + 1;
-        const QString line = QString::fromUtf8( tail.constData() + start, end - start );
-        const auto m = re.match( line );
-        if ( m.hasMatch() ) {
-            return m.captured( 1 );
-        }
-        end = start - 1;
-    }
-    return QString();
 }
 
 void MainWindow::quickSaveAdbLogcat()

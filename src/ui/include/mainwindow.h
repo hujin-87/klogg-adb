@@ -284,19 +284,17 @@ class MainWindow : public QMainWindow {
     // Spawn the long-running `adb <args>` capture process into the given slot,
     // writing stdout straight to the slot's file (truncating or appending), and
     // hook its exit so an unexpected death is detected (see onAdbCaptureExited).
-    // When resumeFromLastTimestamp is set (logcat slot, same boot) the capture
-    // starts with `-T <last timestamp in file>` so only the gap is refilled.
+    // When appending (reconnect, logcat slot) the capture starts with `-T 1` so
+    // only live output follows; logs from the disconnected period are skipped.
     // Returns false if the process could not be started.
-    bool spawnAdbCaptureProcess( bool useKmsgSlot, bool append,
-                                 bool resumeFromLastTimestamp = false );
+    bool spawnAdbCaptureProcess( bool useKmsgSlot, bool append );
     // Handler for the capture process dying on its own (device unplugged, adb
     // server restarted, ...). Marks the tab red and, for the F1 logcat slot,
     // kicks off the reconnect loop so the capture resumes once the device is back.
     void onAdbCaptureExited( bool useKmsgSlot, int exitCode, QProcess::ExitStatus status );
     // Wait for the device to come back (adb wait-for-device) then restart the
-    // logcat capture in append mode, resuming from the last captured timestamp
-    // via `logcat -T` so the gap is refilled from the device ring buffer without
-    // re-dumping everything. Retries until it succeeds or the user presses F2.
+    // logcat capture in append mode with live output only (no ring dump).
+    // Retries until it succeeds or the user presses F2.
     void scheduleAdbLogcatReconnect( int delayMs );
     void cancelAdbLogcatReconnect();
     // Build the logcat -G steps (512M, then 256M if that was rejected) followed
@@ -309,15 +307,12 @@ class MainWindow : public QMainWindow {
     // bar action labels so the user can see it without opening anything.
     void updateAdbLogcatActionLabels();
     // Start/stop the camera PID poll depending on whether a capture is running:
-    // the poll costs two adb round-trips (ps + dumpsys media.camera) and is only
+    // the poll costs an adb round-trip (ps + dumpsys media.camera) and is only
     // useful while logs are being captured.
     void updateCameraPolling();
     // Ask the process to exit cleanly first so adb can flush its last buffered
     // writes to the capture file, only SIGKILL if it does not comply in time.
     static void stopProcessGracefully( QProcess* proc );
-    // Timestamp "MM-DD HH:MM:SS.mmm" of the last complete threadtime line in the
-    // file, or empty if none could be parsed.
-    static QString lastLogcatTimestamp( const QString& filePath );
     // Convert a raw /dev/kmsg capture at srcPath into logcat threadtime format at
     // dstPath using the given boot time. Returns false on I/O error.
     bool convertKmsgFile( const QString& srcPath, const QString& dstPath, double bootEpochSec,
