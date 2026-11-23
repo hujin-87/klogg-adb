@@ -3111,6 +3111,11 @@ void MainWindow::runAdbSequence( const QString& adbExecutable, const QString& bu
 
         const AdbStep& step = ctx->steps[ ctx->index ];
         const bool proceed = step.validate ? step.validate( *ctx->proc, timedOut ) : true;
+        // validate() may run a modal dialog (nested event loop); if the sequence was
+        // cancelled meanwhile, ctx is already gone.
+        if ( ctx->done ) {
+            return;
+        }
         if ( !proceed ) {
             finishAdbSequence( ctx, false );
             return;
@@ -3126,12 +3131,29 @@ void MainWindow::runAdbSequence( const QString& adbExecutable, const QString& bu
     connect( ctx->proc,
              static_cast<void ( QProcess::* )( int, QProcess::ExitStatus )>( &QProcess::finished ),
              this, [ handleStep ]( int, QProcess::ExitStatus ) { handleStep( false ); } );
-    // FailedToStart (no finished signal) also flows here so the chain never hangs.
+    // Only FailedToStart lacks a finished() signal, so only it is handled here.
+    // Crashed is emitted *before* QProcess leaves the Running state and is always
+    // followed by finished(); handling it would make the next step's start() a
+    // silent no-op ("Process is already running") and attribute the stale
+    // finished() to that next step.
     connect( ctx->proc, &QProcess::errorOccurred, this,
-             [ handleStep ]( QProcess::ProcessError ) { handleStep( false ); } );
-    connect( ctx->watchdog, &QTimer::timeout, this, [ this, ctx, handleStep ]() {
+             [ handleStep ]( QProcess::ProcessError error ) {
+                 if ( error == QProcess::FailedToStart ) {
+                     handleStep( false );
+                 }
+             } );
+    connect( ctx->watchdog, &QTimer::timeout, this, [ ctx, handleStep ]() {
         if ( ctx->proc->state() != QProcess::NotRunning ) {
+            // kill() is asynchronous: Qt only notices the death on a later event-loop
+            // pass, and until then start() for the next step is a silent no-op on a
+            // QProcess that still reports Running (the next step would then be skipped
+            // and judged on this step's exit status). Reap synchronously instead;
+            // stepHandled makes the finished() emitted from inside waitForFinished()
+            // a no-op so this step is handled exactly once, as a timeout.
+            ctx->stepHandled = true;
             ctx->proc->kill();
+            ctx->proc->waitForFinished( 1000 );
+            ctx->stepHandled = false;
         }
         handleStep( true );
     } );
@@ -3191,7 +3213,9 @@ void MainWindow::finishAdbSequence( AdbSequenceContext* ctx, bool ok )
 
     auto onSuccess = std::move( ctx->onSuccess );
     auto onFailure = std::move( ctx->onFailure );
-    delete ctx;
+    // Defer the delete: a validate() running a modal dialog may still be on the
+    // stack holding ctx (it re-checks ctx->done when the dialog returns).
+    QTimer::singleShot( 0, this, [ ctx ]() { delete ctx; } );
 
     if ( ok ) {
         if ( onSuccess ) {
@@ -3371,7 +3395,8 @@ void MainWindow::startAdbCapture( const QString& logPath, const QStringList& cap
                     std::move( onSuccess ) );
 }
 
-void MainWindow::appendLogcatBufferSteps( std::vector<AdbStep>& steps )
+void MainWindow::appendLogcatBufferSteps( std::vector<AdbStep>& steps,
+                                          std::function<bool()> onlyIf )
 {
     // Increase device log buffer size before capturing (best-effort).
     // Some buffers (e.g. kernel) may not be resizable on all devices, which makes
@@ -3390,12 +3415,15 @@ void MainWindow::appendLogcatBufferSteps( std::vector<AdbStep>& steps )
                                || proc.exitStatus() != QProcess::NormalExit
                                || proc.exitCode() != 0;
                            return true;
-                       } } );
+                       },
+                       onlyIf } );
     // Devices that refuse 512M (too little memory, per-buffer cap) often still
     // accept a smaller size, so fall back to 256M. Also best-effort.
     steps.push_back( { QStringList() << QStringLiteral( "logcat" ) << QStringLiteral( "-G" )
                                      << QStringLiteral( "256M" ),
-                       15000, nullptr, [ bigBufferRejected ]() { return *bigBufferRejected; } } );
+                       15000, nullptr, [ bigBufferRejected, onlyIf ]() {
+                           return ( !onlyIf || onlyIf() ) && *bigBufferRejected;
+                       } } );
     // Read back what logd actually ended up with. A rejected -G is silent from the
     // capture's point of view but means the device ring is tiny and will overwrite
     // itself under load, so surface the real size in the Stop action label.
@@ -3430,7 +3458,8 @@ void MainWindow::appendLogcatBufferSteps( std::vector<AdbStep>& steps )
                            }
                            // Informational only, never block the capture on it.
                            return true;
-                       } } );
+                       },
+                       onlyIf } );
 }
 
 bool MainWindow::spawnAdbCaptureProcess( bool useKmsgSlot, bool append,
@@ -3553,9 +3582,8 @@ void MainWindow::scheduleAdbLogcatReconnect( int delayMs )
             // still gets picked up.
             steps.push_back( { QStringList() << QStringLiteral( "wait-for-device" ), 30000,
                                []( QProcess&, bool timedOut ) { return !timedOut; } } );
-            // The device may have rebooted, which resets logd's ring size.
-            appendLogcatBufferSteps( steps );
-            // Did it reboot? Decides between resuming with -T and a full ring dump.
+            // Did it reboot? Decides between resuming with -T and a full ring dump,
+            // and whether the ring size needs to be re-applied at all.
             auto bootId = std::make_shared<QString>();
             steps.push_back( { QStringList() << QStringLiteral( "shell" )
                                              << QStringLiteral(
@@ -3567,6 +3595,12 @@ void MainWindow::scheduleAdbLogcatReconnect( int delayMs )
                                                             .trimmed();
                                    return true;
                                } } );
+            // A reboot resets logd's ring size; a USB blip on the same boot does
+            // not, so skip the three resize round-trips and get back to capturing
+            // sooner (the ring is filling up with the gap meanwhile).
+            appendLogcatBufferSteps( steps, [ this, bootId ]() {
+                return bootId->isEmpty() || *bootId != adbBootId_;
+            } );
 
             runAdbSequence(
                 adbExecutable_, QString(), std::move( steps ),
@@ -3835,6 +3869,12 @@ void MainWindow::updateCameraProviderPid()
         return;
     }
 
+    // Both values are fetched in one adb round-trip (one device shell), separated
+    // by a marker line, so a poll costs the logcat transport half of what two
+    // sequential commands did. The `sh -c` line itself shows up in `ps -ef` and
+    // contains the marker text, hence the exact-line comparison below.
+    static const QString separator = QStringLiteral( "KLOGG_CAMERA_SEP" );
+
     if ( !cameraPidProcess_ ) {
         cameraPidProcess_ = new QProcess( this );
         connect(
@@ -3844,80 +3884,47 @@ void MainWindow::updateCameraProviderPid()
                 const auto output
                     = QString::fromUtf8( cameraPidProcess_->readAllStandardOutput() );
                 QString pid;
-                const auto lines = output.split( QLatin1Char( '\n' ) );
-                for ( const auto& line : lines ) {
-                    if ( !line.contains( QStringLiteral( "camera.provider" ),
-                                         Qt::CaseInsensitive ) ) {
-                        continue;
-                    }
-                    // ps -ef columns: UID PID PPID ... ; the PID is the 2nd field.
-                    const auto fields = line.simplified().split( QLatin1Char( ' ' ) );
-                    if ( fields.size() >= 2 ) {
-                        pid = fields.at( 1 );
-                        break;
-                    }
-                }
-                cameraProviderPid_ = pid;
-                // Chain the device-count query so both values land in one label.
-                updateCameraDeviceCount();
-            } );
-    }
-
-    cameraPidProcess_->start( adbExecutable, adbArgs( QStringList() << QStringLiteral( "shell" )
-                                                                    << QStringLiteral( "ps" )
-                                                                    << QStringLiteral( "-ef" ) ) );
-}
-
-void MainWindow::updateCameraDeviceCount()
-{
-    // Skip if a previous query is still running to avoid piling up processes.
-    if ( cameraDeviceProcess_ && cameraDeviceProcess_->state() != QProcess::NotRunning ) {
-        if ( cameraRecoveryPollsLeft_ > 0 ) {
-            QTimer::singleShot( 2000, this, [ this ]() { updateCameraProviderPid(); } );
-        }
-        return;
-    }
-
-    const QString adbExecutable = QStandardPaths::findExecutable( QStringLiteral( "adb" ) );
-    if ( adbExecutable.isEmpty() ) {
-        applyCameraLabel( cameraProviderPid_, QString() );
-        return;
-    }
-
-    if ( !cameraDeviceProcess_ ) {
-        cameraDeviceProcess_ = new QProcess( this );
-        connect(
-            cameraDeviceProcess_,
-            static_cast<void ( QProcess::* )( int, QProcess::ExitStatus )>( &QProcess::finished ),
-            this, [ this ]( int, QProcess::ExitStatus ) {
-                const auto output
-                    = QString::fromUtf8( cameraDeviceProcess_->readAllStandardOutput() );
-                // Expected line: "Number of camera devices: 2". Take the digits
-                // after the last colon; anything non-numeric falls back to "xxx".
                 QString count;
+                bool afterSeparator = false;
                 const auto lines = output.split( QLatin1Char( '\n' ) );
                 for ( const auto& line : lines ) {
-                    if ( !line.contains( QStringLiteral( "Number of camera devices" ),
-                                         Qt::CaseInsensitive ) ) {
+                    if ( line.trimmed() == separator ) {
+                        afterSeparator = true;
                         continue;
                     }
-                    const int colon = line.lastIndexOf( QLatin1Char( ':' ) );
-                    if ( colon >= 0 ) {
-                        count = line.mid( colon + 1 ).trimmed();
+                    if ( !afterSeparator ) {
+                        // ps -ef part: UID PID PPID ... ; the PID is the 2nd field.
+                        if ( pid.isEmpty()
+                             && line.contains( QStringLiteral( "camera.provider" ),
+                                               Qt::CaseInsensitive ) ) {
+                            const auto fields = line.simplified().split( QLatin1Char( ' ' ) );
+                            if ( fields.size() >= 2 ) {
+                                pid = fields.at( 1 );
+                            }
+                        }
                     }
-                    break;
+                    else if ( count.isEmpty()
+                              && line.contains( QStringLiteral( "Number of camera devices" ),
+                                                Qt::CaseInsensitive ) ) {
+                        // dumpsys part, e.g. "Number of camera devices: 2". Take the
+                        // digits after the last colon; non-numeric falls back to "xxx".
+                        const int colon = line.lastIndexOf( QLatin1Char( ':' ) );
+                        if ( colon >= 0 ) {
+                            count = line.mid( colon + 1 ).trimmed();
+                        }
+                    }
                 }
-                applyCameraLabel( cameraProviderPid_, count );
+                applyCameraLabel( pid, count );
             } );
     }
 
-    // Run the pipe on the device's shell as a single argument.
-    cameraDeviceProcess_->start(
+    cameraPidProcess_->start(
         adbExecutable,
         adbArgs( QStringList()
                  << QStringLiteral( "shell" )
-                 << QStringLiteral(
-                        "dumpsys media.camera | grep -iE 'Number of camera devices'" ) ) );
+                 << QStringLiteral( "ps -ef; echo %1; "
+                                    "dumpsys media.camera | grep -iE 'Number of camera devices'" )
+                        .arg( separator ) ) );
 }
 
 void MainWindow::applyCameraLabel( const QString& pid, const QString& deviceCount )

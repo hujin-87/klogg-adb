@@ -151,7 +151,6 @@ class MainWindow : public QMainWindow {
     void quickSaveAdbLogcat();
     void killCameraAdb();
     void updateCameraProviderPid();
-    void updateCameraDeviceCount();
     void applyCameraLabel( const QString& pid, const QString& deviceCount );
     void showAutoClosingSavedDialog( const QString& savePath );
     void onColorLabelsChanged( const ColorLabelsManager::QuickHighlightersCollection& labels );
@@ -299,8 +298,10 @@ class MainWindow : public QMainWindow {
     void cancelAdbLogcatReconnect();
     // Build the logcat -G steps (512M, then 256M if that was rejected) followed
     // by a `logcat -g` read-back that records the effective size in
-    // adbLogcatBufferInfo_ and reflects it in the Stop action label.
-    void appendLogcatBufferSteps( std::vector<AdbStep>& steps );
+    // adbLogcatBufferInfo_ and reflects it in the Stop action label. When onlyIf
+    // is set the whole group is skipped if it evaluates false at run time.
+    void appendLogcatBufferSteps( std::vector<AdbStep>& steps,
+                                  std::function<bool()> onlyIf = nullptr );
     // Reflect capture state (running / reconnecting / buffer size) in the menu
     // bar action labels so the user can see it without opening anything.
     void updateAdbLogcatActionLabels();
@@ -445,13 +446,10 @@ class MainWindow : public QMainWindow {
     // /proc/sys/kernel/random/boot_id of the device when the capture (re)started.
     QString adbBootId_;
 
+    // One adb round-trip fetching both the camera.provider PID (ps -ef) and the
+    // "dumpsys media.camera" device count for the F4 label.
     QProcess* cameraPidProcess_ = nullptr;
-    QProcess* cameraDeviceProcess_ = nullptr;
     QTimer* cameraPidTimer_ = nullptr;
-
-    // Latest camera.provider PID, held between the ps query and the follow-up
-    // "dumpsys media.camera" device-count query so both land in one label.
-    QString cameraProviderPid_;
 
     // Number of short-interval label refreshes still allowed after an F4 kill.
     // The kill leaves the label at "NULL-/0" and, outside a capture, nothing
