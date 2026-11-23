@@ -130,19 +130,11 @@ void signalCrawlerToFollowFile( CrawlerWidget* crawler_widget )
 static constexpr auto ClipboardMaxTry = 5;
 
 // Return the serial numbers of every authorized ("device" state) target listed
-// by `adb devices`. Offline/unauthorized/no-permission entries are skipped.
-QStringList adbAuthorizedDevices( const QString& adbExecutable )
+// in the given `adb devices` output. Offline/unauthorized/no-permission entries
+// are skipped.
+QStringList parseAdbDevices( const QString& out )
 {
-    QProcess process;
-    process.start( adbExecutable, QStringList() << QStringLiteral( "devices" ) );
-    if ( !process.waitForFinished( 8000 ) ) {
-        return {};
-    }
-    if ( process.exitCode() != 0 ) {
-        return {};
-    }
     QStringList serials;
-    const auto out = QString::fromUtf8( process.readAllStandardOutput() );
     const auto lines = out.split( QLatin1Char( '\n' ) );
     // Skip the "List of devices attached" header line.
     for ( int i = 1; i < lines.size(); ++i ) {
@@ -172,6 +164,20 @@ QString kloggCompileDate()
 } // namespace
 
 QTranslator MainWindow::mTranslator;
+
+// One adb command run sequentially by runAdbSequence(). validate() decides whether
+// to continue to the next step (true) or abort the whole sequence (false); it also
+// pops any error dialog. timedOut signals that the watchdog fired for this step.
+// shouldRun(), when set, is evaluated just before the step starts and skips it when
+// false - that is how a step can react to what an earlier step observed (a fallback
+// that only runs after a failure, a command that only runs if a path is missing).
+struct AdbStep {
+    QStringList args;
+    int timeoutMs;
+    std::function<bool( QProcess&, bool timedOut )> validate;
+    std::function<bool()> shouldRun = nullptr;
+};
+
 QTranslator MainWindow::mQtTranslator;
 
 MainWindow::MainWindow( WindowSession session )
@@ -2517,27 +2523,27 @@ void MainWindow::startAdbKmsg()
                      false, /*requireRoot=*/true, /*useKmsgSlot=*/true );
 }
 
-bool MainWindow::queryDeviceBootTime( double& bootEpochSec, int& tzOffsetSec )
+namespace {
+// Device shell command whose output feeds parseDeviceBootTime().
+const QString& deviceBootTimeCommand()
 {
-    const QString adbExecutable = QStandardPaths::findExecutable( QStringLiteral( "adb" ) );
-    if ( adbExecutable.isEmpty() || adbAuthorizedDevices( adbExecutable ).isEmpty() ) {
-        return false;
-    }
+    static const QString cmd = QStringLiteral( "date +%s.%N; cat /proc/uptime; date +%z" );
+    return cmd;
+}
 
-    QProcess p;
-    p.start( adbExecutable, adbArgs( QStringList()
-                                << QStringLiteral( "shell" )
-                                << QStringLiteral( "date +%s.%N; cat /proc/uptime; date +%z" ) ) );
-    if ( !p.waitForFinished( 15000 ) ) {
-        return false;
-    }
-    const auto lines = QString::fromUtf8( p.readAllStandardOutput() )
-                           .split( QLatin1Char( '\n' ), Qt::SkipEmptyParts );
+// Parse the three lines produced by deviceBootTimeCommand() into the device boot
+// wall-clock time (epoch seconds) and timezone offset (seconds).
+bool parseDeviceBootTime( const QString& out, double& bootEpochSec, int& tzOffsetSec )
+{
+    const auto lines = out.split( QLatin1Char( '\n' ), Qt::SkipEmptyParts );
     if ( lines.size() < 3 ) {
         return false;
     }
     const double nowEpochSec = lines[ 0 ].trimmed().toDouble();
     const double uptimeSec = lines[ 1 ].trimmed().section( QLatin1Char( ' ' ), 0, 0 ).toDouble();
+    if ( nowEpochSec <= 0.0 ) {
+        return false;
+    }
     bootEpochSec = nowEpochSec - uptimeSec;
 
     // Parse timezone like "+0800" / "-0530".
@@ -2549,6 +2555,29 @@ bool MainWindow::queryDeviceBootTime( double& bootEpochSec, int& tzOffsetSec )
         tzOffsetSec = ( hh * 3600 + mm * 60 ) * ( tz[ 0 ] == QLatin1Char( '-' ) ? -1 : 1 );
     }
     return true;
+}
+} // namespace
+
+bool MainWindow::queryDeviceBootTime( double& bootEpochSec, int& tzOffsetSec )
+{
+    // Synchronous variant, only used from the (already synchronous, progress-dialog
+    // driven) F9 offline merge when a raw kmsg capture is among the sources. With no
+    // `-s` and several devices adb fails by itself, so no separate `adb devices`.
+    const QString adbExecutable = QStandardPaths::findExecutable( QStringLiteral( "adb" ) );
+    if ( adbExecutable.isEmpty() ) {
+        return false;
+    }
+
+    QProcess p;
+    p.start( adbExecutable,
+             adbArgs( QStringList() << QStringLiteral( "shell" ) << deviceBootTimeCommand() ) );
+    if ( !p.waitForFinished( 15000 ) ) {
+        p.kill();
+        p.waitForFinished( 500 );
+        return false;
+    }
+    return parseDeviceBootTime( QString::fromUtf8( p.readAllStandardOutput() ), bootEpochSec,
+                                tzOffsetSec );
 }
 
 bool MainWindow::convertKmsgFile( const QString& srcPath, const QString& dstPath,
@@ -2697,35 +2726,58 @@ void MainWindow::convertKmsgToLogcat()
         previousColorLabels = currentCrawler->currentColorLabels();
     }
 
-    // Derive the device boot wall-clock time. Requires the (same, not rebooted) device.
-    double bootEpochSec = 0.0;
-    int tzOffsetSec = 0;
-    if ( !queryDeviceBootTime( bootEpochSec, tzOffsetSec ) ) {
-        QMessageBox::warning(
-            this, tr( "klogg" ),
-            tr( "A connected device is required to compute wall-clock time for the kernel log." ) );
+    // Derive the device boot wall-clock time. Requires the (same, not rebooted)
+    // device. Runs async behind the busy dialog like the other adb prep commands;
+    // the conversion itself happens in onSuccess.
+    const QString adbExecutable = QStandardPaths::findExecutable( QStringLiteral( "adb" ) );
+    if ( adbExecutable.isEmpty() ) {
+        QMessageBox::warning( this, tr( "klogg" ),
+                              tr( "Could not find adb in PATH. Install Android platform-tools." ) );
         return;
     }
 
-    const QString dstPath = QDir( QDir::tempPath() ).filePath( QStringLiteral( "kmsg.newT.txt" ) );
-    if ( !convertKmsgFile( srcPath, dstPath, bootEpochSec, tzOffsetSec ) ) {
-        QMessageBox::critical( this, tr( "klogg" ),
-                               tr( "Could not convert the kernel log." ) );
-        return;
-    }
+    auto bootEpochSec = std::make_shared<double>( 0.0 );
+    auto tzOffsetSec = std::make_shared<int>( 0 );
+    std::vector<AdbStep> steps;
+    appendEnsureDeviceStep( steps );
+    steps.push_back(
+        { QStringList() << QStringLiteral( "shell" ) << deviceBootTimeCommand(), 15000,
+          [ this, bootEpochSec, tzOffsetSec ]( QProcess& proc, bool timedOut ) {
+              if ( timedOut
+                   || !parseDeviceBootTime( QString::fromUtf8( proc.readAllStandardOutput() ),
+                                            *bootEpochSec, *tzOffsetSec ) ) {
+                  QMessageBox::warning( this, tr( "klogg" ),
+                                        tr( "A connected device is required to compute "
+                                            "wall-clock time for the kernel log." ) );
+                  return false;
+              }
+              return true;
+          } } );
 
-    if ( !loadFile( dstPath ) ) {
-        return;
-    }
+    runAdbSequence(
+        adbExecutable, tr( "Converting kernel log..." ), std::move( steps ),
+        [ this, srcPath, bootEpochSec, tzOffsetSec, previousSearchText, previousColorLabels ]() {
+            const QString dstPath
+                = QDir( QDir::tempPath() ).filePath( QStringLiteral( "kmsg.newT.txt" ) );
+            if ( !convertKmsgFile( srcPath, dstPath, *bootEpochSec, *tzOffsetSec ) ) {
+                QMessageBox::critical( this, tr( "klogg" ),
+                                       tr( "Could not convert the kernel log." ) );
+                return;
+            }
 
-    // Auto-run the search with the carried-over keyword on the converted tab.
-    if ( auto* crawler = currentCrawlerWidget() ) {
-        crawler->setMatchCase( false );
-        crawler->startSearchWithAutoRefresh( previousSearchText );
-        if ( !previousColorLabels.empty() ) {
-            crawler->restoreColorLabels( previousColorLabels );
-        }
-    }
+            if ( !loadFile( dstPath ) ) {
+                return;
+            }
+
+            // Auto-run the search with the carried-over keyword on the converted tab.
+            if ( auto* crawler = currentCrawlerWidget() ) {
+                crawler->setMatchCase( false );
+                crawler->startSearchWithAutoRefresh( previousSearchText );
+                if ( !previousColorLabels.empty() ) {
+                    crawler->restoreColorLabels( previousColorLabels );
+                }
+            }
+        } );
 }
 
 namespace {
@@ -2995,42 +3047,6 @@ void MainWindow::mergeOpenFilesOffline()
 }
 
 
-bool MainWindow::ensureAdbDevice( const QString& adbExecutable )
-{
-    const QStringList devices = adbAuthorizedDevices( adbExecutable );
-    if ( devices.isEmpty() ) {
-        adbSerial_.clear();
-        QMessageBox::warning(
-            this, tr( "klogg" ),
-            tr( "No authorized device found. Connect a device and check \"adb devices\"." ) );
-        return false;
-    }
-
-    // Reuse a previous choice while that device is still attached.
-    if ( !adbSerial_.isEmpty() && devices.contains( adbSerial_ ) ) {
-        return true;
-    }
-
-    // A single device needs no `-s`; target it implicitly.
-    if ( devices.size() == 1 ) {
-        adbSerial_ = devices.first();
-        return true;
-    }
-
-    // Several devices attached: let the user pick which one to talk to.
-    bool ok = false;
-    const int current = devices.indexOf( adbSerial_ );
-    const QString chosen = QInputDialog::getItem(
-        this, tr( "Select ADB device" ),
-        tr( "Multiple devices detected. Choose the device for ADB commands:" ), devices,
-        current >= 0 ? current : 0, /*editable=*/false, &ok );
-    if ( !ok || chosen.isEmpty() ) {
-        return false;
-    }
-    adbSerial_ = chosen;
-    return true;
-}
-
 QStringList MainWindow::adbArgs( const QStringList& subCommand ) const
 {
     QStringList args;
@@ -3040,19 +3056,6 @@ QStringList MainWindow::adbArgs( const QStringList& subCommand ) const
     args << subCommand;
     return args;
 }
-
-// One adb command run sequentially by runAdbSequence(). validate() decides whether
-// to continue to the next step (true) or abort the whole sequence (false); it also
-// pops any error dialog. timedOut signals that the watchdog fired for this step.
-// shouldRun(), when set, is evaluated just before the step starts and skips it when
-// false - that is how a step can react to what an earlier step observed (a fallback
-// that only runs after a failure, a command that only runs if a path is missing).
-struct AdbStep {
-    QStringList args;
-    int timeoutMs;
-    std::function<bool( QProcess&, bool timedOut )> validate;
-    std::function<bool()> shouldRun = nullptr;
-};
 
 // Heap state kept alive across the async step chain (see runAdbSequence). Owned as
 // a raw pointer and deleted exactly once in finishAdbSequence(); the QObject members
@@ -3069,6 +3072,58 @@ struct AdbSequenceContext {
     bool stepHandled = false; // guards finished-vs-watchdog double handling per step
     bool done = false;        // guards finishAdbSequence running more than once
 };
+
+void MainWindow::appendEnsureDeviceStep( std::vector<AdbStep>& steps )
+{
+    // `adb devices` ignores a stale `-s`, so it is safe whatever adbSerial_ holds.
+    steps.push_back( { QStringList() << QStringLiteral( "devices" ), 10000,
+                       [ this ]( QProcess& proc, bool timedOut ) {
+                           const QStringList devices
+                               = ( timedOut || proc.exitStatus() != QProcess::NormalExit
+                                   || proc.exitCode() != 0 )
+                                     ? QStringList()
+                                     : parseAdbDevices( QString::fromUtf8(
+                                           proc.readAllStandardOutput() ) );
+                           if ( devices.isEmpty() ) {
+                               adbSerial_.clear();
+                               QMessageBox::warning( this, tr( "klogg" ),
+                                                     tr( "No authorized device found. Connect a "
+                                                         "device and check \"adb devices\"." ) );
+                               return false;
+                           }
+
+                           // Reuse a previous choice while that device is still attached.
+                           if ( !adbSerial_.isEmpty() && devices.contains( adbSerial_ ) ) {
+                               return true;
+                           }
+
+                           // First use with a single device: target it implicitly.
+                           if ( adbSerial_.isEmpty() && devices.size() == 1 ) {
+                               adbSerial_ = devices.first();
+                               return true;
+                           }
+
+                           // Several devices, or the device used so far is gone: let the
+                           // user confirm which one to talk to rather than silently
+                           // switching to whatever is plugged in now.
+                           const QString prompt
+                               = adbSerial_.isEmpty()
+                                     ? tr( "Multiple devices detected. Choose the device for "
+                                           "ADB commands:" )
+                                     : tr( "Device %1 is no longer attached. Choose the device "
+                                           "for ADB commands:" )
+                                           .arg( adbSerial_ );
+                           bool ok = false;
+                           const QString chosen = QInputDialog::getItem(
+                               this, tr( "Select ADB device" ), prompt, devices, 0,
+                               /*editable=*/false, &ok );
+                           if ( !ok || chosen.isEmpty() ) {
+                               return false;
+                           }
+                           adbSerial_ = chosen;
+                           return true;
+                       } } );
+}
 
 void MainWindow::runAdbSequence( const QString& adbExecutable, const QString& busyLabel,
                                  std::vector<AdbStep> steps, std::function<void()> onSuccess,
@@ -3243,10 +3298,6 @@ void MainWindow::startAdbCapture( const QString& logPath, const QStringList& cap
         return;
     }
 
-    if ( !ensureAdbDevice( adbExecutable ) ) {
-        return;
-    }
-
     const auto& config = Configuration::get();
     if ( !config.anyFileWatchEnabled() ) {
         QMessageBox::information(
@@ -3268,6 +3319,7 @@ void MainWindow::startAdbCapture( const QString& logPath, const QStringList& cap
     // on a misbehaving device. They now run one at a time via runAdbSequence()
     // behind a cancelable busy dialog; the actual capture starts in onSuccess.
     std::vector<AdbStep> steps;
+    appendEnsureDeviceStep( steps );
     if ( requireRoot ) {
         // Restart adbd as root (needed to read /dev/kmsg). Best-effort: a failure
         // or timeout here is not fatal, capture may still work.
@@ -3757,11 +3809,8 @@ void MainWindow::killCameraAdb()
         return;
     }
 
-    if ( !ensureAdbDevice( adbExecutable ) ) {
-        return;
-    }
-
     std::vector<AdbStep> steps;
+    appendEnsureDeviceStep( steps );
     // Restart adbd with root permissions (best-effort; may already be root or
     // unsupported on production builds). Not fatal on failure/timeout.
     steps.push_back( { QStringList() << QStringLiteral( "root" ), 15000, nullptr } );
@@ -3854,13 +3903,24 @@ void MainWindow::updateCameraPolling()
 
 void MainWindow::updateCameraProviderPid()
 {
-    // Skip if a previous query is still running to avoid piling up processes.
     if ( cameraPidProcess_ && cameraPidProcess_->state() != QProcess::NotRunning ) {
-        // Don't let a slow adb round-trip silently end the post-kill recovery poll.
-        if ( cameraRecoveryPollsLeft_ > 0 ) {
-            QTimer::singleShot( 2000, this, [ this ]() { updateCameraProviderPid(); } );
+        // A previous query is still running. Normally that is just a slow adb
+        // round-trip: don't pile up processes, and don't let it silently end the
+        // post-kill recovery poll either. If it has been stuck for a whole poll
+        // interval (a wedged cameraserver makes dumpsys hang despite the device-side
+        // `timeout`), kill it so the label can be refreshed again.
+        if ( cameraQueryStartedMs_ > 0
+             && QDateTime::currentMSecsSinceEpoch() - cameraQueryStartedMs_
+                    >= CameraQueryStuckMs ) {
+            cameraPidProcess_->kill();
+            cameraPidProcess_->waitForFinished( 500 );
         }
-        return;
+        else {
+            if ( cameraRecoveryPollsLeft_ > 0 ) {
+                QTimer::singleShot( 2000, this, [ this ]() { updateCameraProviderPid(); } );
+            }
+            return;
+        }
     }
 
     const QString adbExecutable = QStandardPaths::findExecutable( QStringLiteral( "adb" ) );
@@ -3872,7 +3932,8 @@ void MainWindow::updateCameraProviderPid()
     // Both values are fetched in one adb round-trip (one device shell), separated
     // by a marker line, so a poll costs the logcat transport half of what two
     // sequential commands did. The `sh -c` line itself shows up in `ps -ef` and
-    // contains the marker text, hence the exact-line comparison below.
+    // contains the marker text, hence the exact-line comparison below. dumpsys is
+    // bounded by toybox `timeout` so a hung cameraserver cannot hold the shell.
     static const QString separator = QStringLiteral( "KLOGG_CAMERA_SEP" );
 
     if ( !cameraPidProcess_ ) {
@@ -3918,18 +3979,19 @@ void MainWindow::updateCameraProviderPid()
             } );
     }
 
+    cameraQueryStartedMs_ = QDateTime::currentMSecsSinceEpoch();
     cameraPidProcess_->start(
         adbExecutable,
         adbArgs( QStringList()
                  << QStringLiteral( "shell" )
-                 << QStringLiteral( "ps -ef; echo %1; "
-                                    "dumpsys media.camera | grep -iE 'Number of camera devices'" )
+                 << QStringLiteral( "ps -ef; echo %1; timeout 3 dumpsys media.camera "
+                                    "| grep -iE 'Number of camera devices'" )
                         .arg( separator ) ) );
 }
 
 void MainWindow::applyCameraLabel( const QString& pid, const QString& deviceCount )
 {
-    const QString pidShown = pid.isEmpty() ? QStringLiteral( "NULL-" ) : pid;
+    const QString pidShown = pid.isEmpty() ? QStringLiteral( "NULL" ) : pid;
 
     // Only accept a plain Arabic-numeral count; otherwise show the literal "xxx".
     bool numeric = !deviceCount.isEmpty();

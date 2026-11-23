@@ -255,15 +255,18 @@ class MainWindow : public QMainWindow {
     // logcat threadtime format with wall-clock timestamps, write it to
     // kmsg.newT.txt and open it.
     void convertKmsgToLogcat();
-    // Query the connected device for its boot wall-clock time (epoch seconds) and
-    // timezone offset (seconds). Returns false if no device / query failed.
+    // Synchronously query the connected device for its boot wall-clock time (epoch
+    // seconds) and timezone offset (seconds). Only used by the F9 offline merge,
+    // which is itself synchronous; F6 goes through runAdbSequence instead.
     bool queryDeviceBootTime( double& bootEpochSec, int& tzOffsetSec );
-    // Ensure a target device is selected for the ADB commands. If several devices
-    // are authorized and none is currently selected (or the selection is gone),
-    // the user is prompted to pick one; the choice is remembered in adbSerial_ and
-    // passed as `-s <serial>` to subsequent adb calls. Returns false when no device
-    // is available or the user cancels the selection.
-    bool ensureAdbDevice( const QString& adbExecutable );
+    // Append the `adb devices` step that selects the target device for the rest of
+    // the sequence (runs async behind the busy dialog; `adb devices` also starts
+    // the adb server, which used to freeze the UI for seconds). If several
+    // devices are authorized and none is selected, or the previous selection is
+    // gone, the user is prompted; the choice is remembered in adbSerial_ and passed
+    // as `-s <serial>` to the following steps. The step fails (aborting the
+    // sequence) when no device is available or the user cancels.
+    void appendEnsureDeviceStep( std::vector<AdbStep>& steps );
     // Build an adb argument list, prepending `-s <serial>` when a target device
     // has been selected so the command is directed at that specific device.
     QStringList adbArgs( const QStringList& subCommand ) const;
@@ -426,7 +429,7 @@ class MainWindow : public QMainWindow {
     QProcess* adbKmsgProcess_ = nullptr;
     QString adbKmsgFilePath_;
     // Serial of the device chosen when multiple are attached; empty means "use
-    // the single/default device" (no `-s` flag). See ensureAdbDevice/adbArgs.
+    // the single/default device" (no `-s` flag). See appendEnsureDeviceStep/adbArgs.
     QString adbSerial_;
 
     // Capture session state. The session outlives the adb process: while the
@@ -450,9 +453,13 @@ class MainWindow : public QMainWindow {
     // "dumpsys media.camera" device count for the F4 label.
     QProcess* cameraPidProcess_ = nullptr;
     QTimer* cameraPidTimer_ = nullptr;
+    // When the running camera query was started; a query older than
+    // CameraQueryStuckMs is killed and restarted instead of being waited for.
+    qint64 cameraQueryStartedMs_ = 0;
+    static constexpr qint64 CameraQueryStuckMs = 10000;
 
     // Number of short-interval label refreshes still allowed after an F4 kill.
-    // The kill leaves the label at "NULL-/0" and, outside a capture, nothing
+    // The kill leaves the label at "NULL/0" and, outside a capture, nothing
     // else would refresh it once the HAL has restarted a few seconds later.
     int cameraRecoveryPollsLeft_ = 0;
 
