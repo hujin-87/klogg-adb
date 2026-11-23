@@ -3790,9 +3790,15 @@ void MainWindow::killCameraAdb()
               return true;
           } } );
 
-    // The kill just changed the process table; refresh the F4 label right away.
+    // The kill just changed the process table; refresh the F4 label right away
+    // and keep re-polling briefly so the label follows the HAL restart (the
+    // provider/cameraserver come back a few seconds after pkill, and outside a
+    // capture nothing else would refresh the label).
     runAdbSequence( adbExecutable, tr( "Killing camera processes..." ), std::move( steps ),
-                    [ this ]() { updateCameraProviderPid(); } );
+                    [ this ]() {
+                        cameraRecoveryPollsLeft_ = 15;
+                        updateCameraProviderPid();
+                    } );
 }
 
 void MainWindow::updateCameraPolling()
@@ -3816,6 +3822,10 @@ void MainWindow::updateCameraProviderPid()
 {
     // Skip if a previous query is still running to avoid piling up processes.
     if ( cameraPidProcess_ && cameraPidProcess_->state() != QProcess::NotRunning ) {
+        // Don't let a slow adb round-trip silently end the post-kill recovery poll.
+        if ( cameraRecoveryPollsLeft_ > 0 ) {
+            QTimer::singleShot( 2000, this, [ this ]() { updateCameraProviderPid(); } );
+        }
         return;
     }
 
@@ -3862,6 +3872,9 @@ void MainWindow::updateCameraDeviceCount()
 {
     // Skip if a previous query is still running to avoid piling up processes.
     if ( cameraDeviceProcess_ && cameraDeviceProcess_->state() != QProcess::NotRunning ) {
+        if ( cameraRecoveryPollsLeft_ > 0 ) {
+            QTimer::singleShot( 2000, this, [ this ]() { updateCameraProviderPid(); } );
+        }
         return;
     }
 
@@ -3923,6 +3936,19 @@ void MainWindow::applyCameraLabel( const QString& pid, const QString& deviceCoun
 
     adbKillCameraAction->setText(
         tr( "Kill Camera(F4) [%1-%2]" ).arg( pidShown, countShown ) );
+
+    // Post-kill recovery: keep polling every 2 s until the provider is back
+    // and cameraserver reports at least one device, or the budget runs out.
+    if ( cameraRecoveryPollsLeft_ > 0 ) {
+        const bool recovered = !pid.isEmpty() && numeric && deviceCount.toInt() > 0;
+        if ( recovered ) {
+            cameraRecoveryPollsLeft_ = 0;
+        }
+        else {
+            --cameraRecoveryPollsLeft_;
+            QTimer::singleShot( 2000, this, [ this ]() { updateCameraProviderPid(); } );
+        }
+    }
 }
 
 void MainWindow::showAutoClosingSavedDialog( const QString& savePath )

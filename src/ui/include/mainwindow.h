@@ -453,6 +453,11 @@ class MainWindow : public QMainWindow {
     // "dumpsys media.camera" device-count query so both land in one label.
     QString cameraProviderPid_;
 
+    // Number of short-interval label refreshes still allowed after an F4 kill.
+    // The kill leaves the label at "NULL-/0" and, outside a capture, nothing
+    // else would refresh it once the HAL has restarted a few seconds later.
+    int cameraRecoveryPollsLeft_ = 0;
+
     ColorLabelsManager::QuickHighlightersCollection globalColorLabels_;
 
     bool isMaximized_ = false;
