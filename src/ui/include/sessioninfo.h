@@ -44,6 +44,7 @@
 
 #include <QByteArray>
 #include <QString>
+#include <QStringList>
 
 #include "persistable.h"
 
@@ -82,6 +83,13 @@ class SessionInfo : public Persistable<SessionInfo, session_settings> {
         QString id;
         QByteArray geometry;
         std::vector<OpenFile> openFiles;
+
+        // Workspace opened in this window: path of the .code-workspace file,
+        // or (untitled workspace) the list of folders. Both empty if none.
+        QString workspaceFile;
+        QStringList workspaceFolders;
+        // Dock/toolbar layout (QMainWindow::saveState), e.g. explorer position.
+        QByteArray state;
     };
 
     void add( const QString& windowId )
@@ -142,6 +150,42 @@ class SessionInfo : public Persistable<SessionInfo, session_settings> {
         auto window = findWindow( windowId );
         if ( window ) {
             window->openFiles = loaded_files;
+        }
+    }
+
+    QString workspaceFile( const QString& windowId ) const
+    {
+        auto window = findWindow( windowId );
+        return window ? window->workspaceFile : QString{};
+    }
+
+    QStringList workspaceFolders( const QString& windowId ) const
+    {
+        auto window = findWindow( windowId );
+        return window ? window->workspaceFolders : QStringList{};
+    }
+
+    void setWorkspace( const QString& windowId, const QString& workspaceFile,
+                       const QStringList& workspaceFolders )
+    {
+        auto window = findWindow( windowId );
+        if ( window ) {
+            window->workspaceFile = workspaceFile;
+            window->workspaceFolders = workspaceFolders;
+        }
+    }
+
+    QByteArray state( const QString& windowId ) const
+    {
+        auto window = findWindow( windowId );
+        return window ? window->state : QByteArray{};
+    }
+
+    void setState( const QString& windowId, const QByteArray& state )
+    {
+        auto window = findWindow( windowId );
+        if ( window ) {
+            window->state = state;
         }
     }
 

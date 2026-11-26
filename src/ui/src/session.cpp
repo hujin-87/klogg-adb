@@ -220,6 +220,34 @@ void WindowSession::restoreGeometry( QByteArray* geometry ) const
     *geometry = session.geometry( windowId_ );
 }
 
+QByteArray WindowSession::restoreState() const
+{
+    const auto& session = SessionInfo::getSynced();
+    return session.state( windowId_ );
+}
+
+void WindowSession::saveState( const QByteArray& state )
+{
+    auto& session = SessionInfo::getSynced();
+    session.setState( windowId_, state );
+    session.save();
+}
+
+void WindowSession::restoreWorkspace( QString* workspaceFile, QStringList* workspaceFolders ) const
+{
+    const auto& session = SessionInfo::getSynced();
+    *workspaceFile = session.workspaceFile( windowId_ );
+    *workspaceFolders = session.workspaceFolders( windowId_ );
+}
+
+void WindowSession::saveWorkspace( const QString& workspaceFile,
+                                   const QStringList& workspaceFolders )
+{
+    auto& session = SessionInfo::getSynced();
+    session.setWorkspace( windowId_, workspaceFile, workspaceFolders );
+    session.save();
+}
+
 bool WindowSession::close()
 {
     LOG_INFO << "close window session " << windowId_;

@@ -69,12 +69,15 @@ struct AdbSequenceContext;
 #include "signalmux.h"
 #include "tabbedcrawlerwidget.h"
 #include "tabbedscratchpad.h"
+#include "workspace.h"
 
 class QAction;
 class QActionGroup;
+class QDockWidget;
 class Session;
 class RecentFiles;
 class HighlightersMenu;
+class WorkspaceExplorer;
 
 // Main window of the application, creates menus, toolbar and
 // the CrawlerWidget
@@ -91,6 +94,15 @@ class MainWindow : public QMainWindow {
     void reloadSession();
     // Loads the initial file (parameter passed or from config file)
     void loadInitialFile( QString fileName, bool followFile );
+
+    // Open a path of any kind: a directory becomes the workspace (VS Code
+    // "Open Folder"), a .code-workspace file is loaded as a workspace, and
+    // anything else is opened as a log file in a new tab.
+    bool openPath( const QString& path, bool followFile = false );
+
+    // Workspace (VS Code style multi-root folder set shown in the explorer).
+    bool openFolderAsWorkspace( const QString& folderPath );
+    bool openWorkspaceFile( const QString& filePath );
 
     void reTranslateUI();
 
@@ -114,8 +126,17 @@ class MainWindow : public QMainWindow {
   private:
     enum class ActionInitiator { User, App };
 
+  public Q_SLOTS:
+    // Workspace commands (also used by menus and the explorer).
+    void openFolder();
+    void openWorkspace();
+    void addFolderToWorkspace();
+    void saveWorkspaceAs();
+    void closeWorkspace();
+
   private Q_SLOTS:
     void open();
+    void openRecentWorkspace( QAction* action );
     void openFileFromRecent( QAction* action );
     void openFileFromFavorites( QAction* action );
     void switchToOpenedFile( QAction* action );
@@ -227,6 +248,14 @@ class MainWindow : public QMainWindow {
     void updateFavoritesMenu();
     void updateOpenedFilesMenu();
     void updateHighlightersMenu();
+    // Workspace helpers: push the model to the explorer, title bar, actions
+    // and persist it in this window's session.
+    void applyWorkspaceChange();
+    // UI-only part of applyWorkspaceChange (no persistence).
+    void updateWorkspaceUi();
+    void addRecentWorkspace( const QString& path );
+    void updateRecentWorkspacesMenu();
+    void createExplorerDock();
     QString strippedName( const QString& fullFileName ) const;
     CrawlerWidget* currentCrawlerWidget() const;
     void displayQuickFindBar( QuickFindMux::QFDirection direction );
@@ -326,6 +355,7 @@ class MainWindow : public QMainWindow {
 
     QMenu* fileMenu;
     QMenu* recentFilesMenu;
+    QMenu* recentWorkspacesMenu;
     QMenu* editMenu;
     QMenu* viewMenu;
     QMenu* toolsMenu;
@@ -345,6 +375,14 @@ class MainWindow : public QMainWindow {
 
     QAction* newWindowAction;
     QAction* openAction;
+    QAction* openFolderAction;
+    QAction* openWorkspaceAction;
+    QAction* addFolderToWorkspaceAction;
+    QAction* saveWorkspaceAsAction;
+    QAction* closeWorkspaceAction;
+    QAction* recentWorkspacesCleanup;
+    QAction* toggleExplorerAction;
+    QActionGroup* recentWorkspacesGroup;
     QAction* closeAction;
     QAction* closeAllAction;
     QAction* exitAction;
@@ -416,6 +454,11 @@ class MainWindow : public QMainWindow {
     TabbedCrawlerWidget mainTabWidget_;
 
     TabbedScratchPad scratchPad_;
+
+    // VS Code style workspace: folders shown in the explorer side panel.
+    Workspace workspace_;
+    WorkspaceExplorer* workspaceExplorer_ = nullptr;
+    QDockWidget* explorerDock_ = nullptr;
 
     QTemporaryDir tempDir_;
 

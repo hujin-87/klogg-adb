@@ -13,6 +13,9 @@ const char* menu::fileTitle = QT_TR_NOOP( "&File" );
 const char* menu::editTitle = QT_TR_NOOP( "&Edit" );
 const char* menu::viewTitle = QT_TR_NOOP( "&View" );
 const char* menu::openedFilesTitle = QT_TR_NOOP( "Opened files" );
+const char* menu::recentFilesTitle = QT_TR_NOOP( "Open Recent" );
+const char* menu::recentWorkspacesTitle = QT_TR_NOOP( "Open Recent Workspace" );
+const char* menu::explorerTitle = QT_TR_NOOP( "Explorer" );
 const char* menu::toolsTitle = QT_TR_NOOP( "&Tools" );
 const char* menu::highlightersTitle = QT_TR_NOOP( "Highlighters" );
 const char* menu::favoritesTitle = QT_TR_NOOP( "F&avorites" );
@@ -30,6 +33,23 @@ const char* action::newWindowText = QT_TR_NOOP( "&New window" );
 const char* action::newWindowStatusTip = QT_TR_NOOP( "Create new klogg window" );
 const char* action::openText = QT_TR_NOOP( "&Open..." );
 const char* action::openStatusTip = QT_TR_NOOP( "Open a file" );
+const char* action::openFolderText = QT_TR_NOOP( "Open &Folder..." );
+const char* action::openFolderStatusTip
+    = QT_TR_NOOP( "Open a folder as the workspace and show it in the explorer" );
+const char* action::openWorkspaceText = QT_TR_NOOP( "Open &Workspace from File..." );
+const char* action::openWorkspaceStatusTip
+    = QT_TR_NOOP( "Open a Visual Studio Code .code-workspace file" );
+const char* action::addFolderToWorkspaceText = QT_TR_NOOP( "A&dd Folder to Workspace..." );
+const char* action::addFolderToWorkspaceStatusTip
+    = QT_TR_NOOP( "Add another root folder to the current workspace" );
+const char* action::saveWorkspaceAsText = QT_TR_NOOP( "Save Workspace As..." );
+const char* action::saveWorkspaceAsStatusTip
+    = QT_TR_NOOP( "Save the current folders to a .code-workspace file" );
+const char* action::closeWorkspaceText = QT_TR_NOOP( "Close Workspace" );
+const char* action::closeWorkspaceStatusTip = QT_TR_NOOP( "Close the current workspace" );
+const char* action::toggleExplorerText = QT_TR_NOOP( "&Explorer" );
+const char* action::toggleExplorerStatusTip = QT_TR_NOOP( "Show or hide the workspace explorer" );
+const char* action::recentWorkspacesCleanupText = QT_TR_NOOP( "Clear List" );
 const char* action::recentFilesCleanupText = QT_TR_NOOP("Clear List");
 const char* action::closeText = QT_TR_NOOP( "&Close" );
 const char* action::closeStatusTip = QT_TR_NOOP( "Close document" );

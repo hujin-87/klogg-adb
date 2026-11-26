@@ -210,6 +210,15 @@ class WindowSession {
     // Get the geometry string from persistent storage for this session.
     void restoreGeometry( QByteArray* geometry ) const;
 
+    // Dock/toolbar layout (QMainWindow::saveState) for this window.
+    QByteArray restoreState() const;
+    void saveState( const QByteArray& state );
+
+    // Workspace of this window (see SessionInfo::Window). Persisted
+    // immediately, independent of the open-files list.
+    void restoreWorkspace( QString* workspaceFile, QStringList* workspaceFolders ) const;
+    void saveWorkspace( const QString& workspaceFile, const QStringList& workspaceFolders );
+
     // Save the session to persistent storage. An ordered list of
     // (view, topline, ViewContextInterface) is passed, this is because only
     // the main window know the order in which the views are presented to

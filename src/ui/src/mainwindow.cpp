@@ -62,6 +62,7 @@
 #include <QDateTime>
 #include <QDir>
 #include <QDialogButtonBox>
+#include <QDockWidget>
 #include <QFile>
 #include <QTextStream>
 #include <QFileDialog>
@@ -115,10 +116,12 @@
 #include "progress.h"
 #include "readablesize.h"
 #include "recentfiles.h"
+#include "recentworkspaces.h"
 #include "sessioninfo.h"
 #include "shortcuts.h"
 #include "styles.h"
 #include "tabbedcrawlerwidget.h"
+#include "workspaceexplorer.h"
 
 namespace {
 
@@ -291,6 +294,8 @@ MainWindow::MainWindow( WindowSession session )
 
     setCentralWidget( central_widget );
 
+    createExplorerDock();
+
     updateTitleBar( "" );
     loadIcons();
     reTranslateUI();
@@ -302,10 +307,32 @@ void MainWindow::reloadGeometry()
 
     session_.restoreGeometry( &geometry );
     restoreGeometry( geometry );
+
+    const auto state = session_.restoreState();
+    if ( !state.isEmpty() ) {
+        restoreState( state );
+    }
 }
 
 void MainWindow::reloadSession()
 {
+    // Restore the workspace of this window before its files so the
+    // explorer is ready when the tabs appear.
+    QString workspaceFile;
+    QStringList workspaceFolders;
+    session_.restoreWorkspace( &workspaceFile, &workspaceFolders );
+    if ( !workspaceFile.isEmpty() ) {
+        QString error;
+        if ( !workspace_.load( workspaceFile, &error ) ) {
+            LOG_WARNING << "Could not restore workspace " << workspaceFile << ": " << error;
+            workspace_.clear();
+        }
+    }
+    else if ( !workspaceFolders.isEmpty() ) {
+        workspace_.setFolderPaths( workspaceFolders );
+    }
+    applyWorkspaceChange();
+
     const auto& config = Configuration::get();
     // Restored files follow by default so live logs tail automatically,
     // regardless of the persisted "follow on load" preference (matches the
@@ -349,7 +376,299 @@ void MainWindow::loadInitialFile( QString fileName, bool followFile )
 
     // Is there a file passed as argument?
     if ( !fileName.isEmpty() ) {
-        loadFile( fileName, followFile );
+        openPath( fileName, followFile );
+    }
+}
+
+bool MainWindow::openPath( const QString& path, bool followFile )
+{
+    const QFileInfo info( path );
+    if ( info.isDir() ) {
+        return openFolderAsWorkspace( path );
+    }
+    if ( Workspace::isWorkspaceFile( path ) ) {
+        return openWorkspaceFile( path );
+    }
+    return loadFile( path, followFile );
+}
+
+//
+// Workspace
+//
+
+void MainWindow::createExplorerDock()
+{
+    using namespace klogg::mainwindow;
+
+    workspaceExplorer_ = new WorkspaceExplorer( this );
+
+    explorerDock_ = new QDockWidget( tr( menu::explorerTitle ), this );
+    explorerDock_->setObjectName( QStringLiteral( "WorkspaceExplorerDock" ) );
+    explorerDock_->setAllowedAreas( Qt::LeftDockWidgetArea | Qt::RightDockWidgetArea );
+    explorerDock_->setFeatures( QDockWidget::DockWidgetMovable | QDockWidget::DockWidgetClosable );
+    explorerDock_->setWidget( workspaceExplorer_ );
+    addDockWidget( Qt::LeftDockWidgetArea, explorerDock_ );
+    // Hidden until a folder is opened; the toggle action shows it on demand.
+    explorerDock_->hide();
+
+    toggleExplorerAction = explorerDock_->toggleViewAction();
+    toggleExplorerAction->setStatusTip( tr( action::toggleExplorerStatusTip ) );
+    toggleExplorerAction->setShortcut( QKeySequence( QStringLiteral( "Ctrl+Shift+E" ) ) );
+    viewMenu->insertAction( viewMenu->actions().value( 0 ), toggleExplorerAction );
+    viewMenu->insertSeparator( viewMenu->actions().value( 1 ) );
+
+    connect( workspaceExplorer_, &WorkspaceExplorer::fileActivated, this,
+             [ this ]( const QString& file ) { openPath( file ); } );
+    connect( workspaceExplorer_, &WorkspaceExplorer::addFolderRequested, this,
+             &MainWindow::addFolderToWorkspace );
+    connect( workspaceExplorer_, &WorkspaceExplorer::openFolderRequested, this,
+             &MainWindow::openFolder );
+    connect( workspaceExplorer_, &WorkspaceExplorer::openWorkspaceFileRequested, this,
+             &MainWindow::openWorkspace );
+    connect( workspaceExplorer_, &WorkspaceExplorer::removeFolderRequested, this,
+             [ this ]( const QString& folder ) {
+                 if ( workspace_.removeFolder( folder ) ) {
+                     applyWorkspaceChange();
+                 }
+             } );
+}
+
+bool MainWindow::openFolderAsWorkspace( const QString& folderPath )
+{
+    const auto absolute = QDir::cleanPath( QFileInfo( folderPath ).absoluteFilePath() );
+    if ( !QFileInfo( absolute ).isDir() ) {
+        QMessageBox::warning( this, tr( "klogg - workspace" ),
+                              tr( "%1 is not a folder" ).arg( QDir::toNativeSeparators( absolute ) ) );
+        return false;
+    }
+
+    // Already the (only) root: nothing to do.
+    if ( workspace_.isUntitled() && workspace_.folders().size() == 1
+         && workspace_.containsFolder( absolute ) ) {
+        explorerDock_->show();
+        return true;
+    }
+
+    workspace_.clear();
+    workspace_.addFolder( absolute );
+    addRecentWorkspace( absolute );
+    applyWorkspaceChange();
+    explorerDock_->show();
+    return true;
+}
+
+bool MainWindow::openWorkspaceFile( const QString& filePath )
+{
+    Workspace loaded;
+    QString error;
+    if ( !loaded.load( filePath, &error ) ) {
+        QMessageBox::warning( this, tr( "klogg - workspace" ),
+                              tr( "Could not open workspace %1:\n%2" )
+                                  .arg( QDir::toNativeSeparators( filePath ), error ) );
+        return false;
+    }
+
+    workspace_ = std::move( loaded );
+    addRecentWorkspace( workspace_.filePath() );
+    applyWorkspaceChange();
+    explorerDock_->show();
+    return true;
+}
+
+void MainWindow::openFolder()
+{
+    QString defaultDir = QDir::homePath();
+    if ( !workspace_.isEmpty() ) {
+        defaultDir = workspace_.folders().front().path;
+    }
+    else if ( auto current = currentCrawlerWidget() ) {
+        defaultDir = QFileInfo( session_.getFilename( current ) ).path();
+    }
+
+    const auto folder = QFileDialog::getExistingDirectory(
+        this, tr( "Open Folder" ), defaultDir,
+        QFileDialog::ShowDirsOnly | QFileDialog::DontResolveSymlinks );
+    if ( !folder.isEmpty() ) {
+        openFolderAsWorkspace( folder );
+    }
+}
+
+void MainWindow::openWorkspace()
+{
+    QString defaultDir = QDir::homePath();
+    if ( !workspace_.isUntitled() ) {
+        defaultDir = QFileInfo( workspace_.filePath() ).path();
+    }
+    else if ( !workspace_.isEmpty() ) {
+        defaultDir = workspace_.folders().front().path;
+    }
+
+    const auto file = QFileDialog::getOpenFileName(
+        this, tr( "Open Workspace from File" ), defaultDir,
+        tr( "Workspace files (*.%1);;All files (*)" ).arg( Workspace::FileExtension ) );
+    if ( !file.isEmpty() ) {
+        openWorkspaceFile( file );
+    }
+}
+
+void MainWindow::addFolderToWorkspace()
+{
+    QString defaultDir = QDir::homePath();
+    if ( !workspace_.isEmpty() ) {
+        defaultDir = QFileInfo( workspace_.folders().back().path ).path();
+    }
+
+    const auto folder = QFileDialog::getExistingDirectory(
+        this, tr( "Add Folder to Workspace" ), defaultDir,
+        QFileDialog::ShowDirsOnly | QFileDialog::DontResolveSymlinks );
+    if ( folder.isEmpty() ) {
+        return;
+    }
+
+    if ( !workspace_.addFolder( folder ) ) {
+        return;
+    }
+    if ( workspace_.isUntitled() && workspace_.folders().size() == 1 ) {
+        addRecentWorkspace( workspace_.folders().front().path );
+    }
+    applyWorkspaceChange();
+    explorerDock_->show();
+}
+
+void MainWindow::saveWorkspaceAs()
+{
+    QString suggested;
+    if ( !workspace_.isUntitled() ) {
+        suggested = workspace_.filePath();
+    }
+    else if ( !workspace_.isEmpty() ) {
+        const auto& first = workspace_.folders().front().path;
+        suggested = QDir( first ).filePath( QStringLiteral( "%1.%2" )
+                                                .arg( QFileInfo( first ).fileName(),
+                                                      Workspace::FileExtension ) );
+    }
+    else {
+        suggested = QDir::home().filePath(
+            QStringLiteral( "untitled.%1" ).arg( Workspace::FileExtension ) );
+    }
+
+    auto file = QFileDialog::getSaveFileName(
+        this, tr( "Save Workspace As" ), suggested,
+        tr( "Workspace files (*.%1)" ).arg( Workspace::FileExtension ) );
+    if ( file.isEmpty() ) {
+        return;
+    }
+    if ( !Workspace::isWorkspaceFile( file ) ) {
+        file += QStringLiteral( ".%1" ).arg( Workspace::FileExtension );
+    }
+
+    QString error;
+    if ( !workspace_.save( file, &error ) ) {
+        QMessageBox::warning( this, tr( "klogg - workspace" ),
+                              tr( "Could not save workspace %1:\n%2" )
+                                  .arg( QDir::toNativeSeparators( file ), error ) );
+        return;
+    }
+
+    addRecentWorkspace( workspace_.filePath() );
+    applyWorkspaceChange();
+}
+
+void MainWindow::closeWorkspace()
+{
+    if ( workspace_.isEmpty() ) {
+        return;
+    }
+    workspace_.clear();
+    applyWorkspaceChange();
+}
+
+void MainWindow::applyWorkspaceChange()
+{
+    updateWorkspaceUi();
+
+    session_.saveWorkspace( workspace_.isUntitled() ? QString{} : workspace_.filePath(),
+                            workspace_.isUntitled() ? workspace_.folderPaths() : QStringList{} );
+}
+
+void MainWindow::updateWorkspaceUi()
+{
+    using namespace klogg::mainwindow;
+
+    workspaceExplorer_->setWorkspace( workspace_ );
+
+    const bool hasWorkspace = !workspace_.isEmpty();
+    saveWorkspaceAsAction->setEnabled( hasWorkspace );
+    closeWorkspaceAction->setEnabled( hasWorkspace );
+    closeWorkspaceAction->setText( workspace_.isUntitled()
+                                       ? tr( "Close Folder" )
+                                       : QApplication::translate( "klogg::mainwindow::action",
+                                                                  action::closeWorkspaceText ) );
+
+    // Window title follows VS Code: "<file> - <workspace> - klogg".
+    if ( auto current = currentCrawlerWidget() ) {
+        updateTitleBar( session_.getFilename( current ) );
+    }
+    else {
+        updateTitleBar( "" );
+    }
+}
+
+void MainWindow::addRecentWorkspace( const QString& path )
+{
+    auto& recent = RecentWorkspaces::getSynced();
+    recent.addRecent( path );
+    recent.save();
+    updateRecentWorkspacesMenu();
+}
+
+void MainWindow::updateRecentWorkspacesMenu()
+{
+    using namespace klogg::mainwindow;
+
+    recentWorkspacesMenu->clear();
+
+    const auto items = RecentWorkspaces::get().recentWorkspaces();
+    recentWorkspacesMenu->setEnabled( !items.isEmpty() );
+
+    for ( const auto& path : items ) {
+        const QFileInfo info( path );
+        const bool isFile = Workspace::isWorkspaceFile( path ) && !info.isDir();
+        // VS Code shows the workspace name and, for files, "(Workspace)".
+        const auto label = isFile ? tr( "%1 (Workspace)" ).arg( info.completeBaseName() )
+                                  : info.fileName();
+        auto* action = recentWorkspacesMenu->addAction( label );
+        action->setToolTip( QDir::toNativeSeparators( path ) );
+        action->setData( path );
+        action->setActionGroup( recentWorkspacesGroup );
+    }
+
+    recentWorkspacesMenu->addSeparator();
+    recentWorkspacesMenu->addAction( recentWorkspacesCleanup );
+}
+
+void MainWindow::openRecentWorkspace( QAction* action )
+{
+    if ( !action ) {
+        return;
+    }
+
+    const auto path = action->data().toString();
+    if ( QFileInfo::exists( path ) ) {
+        openPath( path );
+        return;
+    }
+
+    const auto userAction = QMessageBox::question(
+        this, tr( "klogg - remove from recent" ),
+        tr( "Could not open %1. Remove it from recent workspaces?" )
+            .arg( QDir::toNativeSeparators( path ) ),
+        QMessageBox::Yes | QMessageBox::No, QMessageBox::No );
+    if ( userAction == QMessageBox::Yes ) {
+        auto& recent = RecentWorkspaces::getSynced();
+        recent.removeRecent( path );
+        recent.save();
+        updateRecentWorkspacesMenu();
     }
 }
 
@@ -382,6 +701,27 @@ void MainWindow::reTranslateUI()
 
     openAction->setText( transAction( action::openText ) );
     openAction->setStatusTip( transAction( action::openStatusTip ) );
+
+    openFolderAction->setText( transAction( action::openFolderText ) );
+    openFolderAction->setStatusTip( transAction( action::openFolderStatusTip ) );
+    openWorkspaceAction->setText( transAction( action::openWorkspaceText ) );
+    openWorkspaceAction->setStatusTip( transAction( action::openWorkspaceStatusTip ) );
+    addFolderToWorkspaceAction->setText( transAction( action::addFolderToWorkspaceText ) );
+    addFolderToWorkspaceAction->setStatusTip(
+        transAction( action::addFolderToWorkspaceStatusTip ) );
+    saveWorkspaceAsAction->setText( transAction( action::saveWorkspaceAsText ) );
+    saveWorkspaceAsAction->setStatusTip( transAction( action::saveWorkspaceAsStatusTip ) );
+    closeWorkspaceAction->setStatusTip( transAction( action::closeWorkspaceStatusTip ) );
+    recentWorkspacesCleanup->setText( transAction( action::recentWorkspacesCleanupText ) );
+    recentFilesMenu->setTitle( transMenu( menu::recentFilesTitle ) );
+    recentWorkspacesMenu->setTitle( transMenu( menu::recentWorkspacesTitle ) );
+    if ( explorerDock_ ) {
+        explorerDock_->setWindowTitle( transMenu( menu::explorerTitle ) );
+        toggleExplorerAction->setText( transAction( action::toggleExplorerText ) );
+        toggleExplorerAction->setStatusTip( transAction( action::toggleExplorerStatusTip ) );
+        workspaceExplorer_->reTranslateUI();
+        updateWorkspaceUi();
+    }
 
     recentFilesCleanup->setText( transAction( action::recentFilesCleanupText ) );
 
@@ -540,6 +880,48 @@ void MainWindow::createActions()
     openAction = new QAction( tr( action::openText ), this );
     openAction->setStatusTip( tr( action::openStatusTip ) );
     connect( openAction, &QAction::triggered, [ this ]( auto ) { this->open(); } );
+
+    openFolderAction = new QAction( tr( action::openFolderText ), this );
+    openFolderAction->setStatusTip( tr( action::openFolderStatusTip ) );
+    // VS Code chord: Ctrl+K Ctrl+O
+    openFolderAction->setShortcut( QKeySequence( QStringLiteral( "Ctrl+K, Ctrl+O" ) ) );
+    connect( openFolderAction, &QAction::triggered, this, [ this ]( auto ) { this->openFolder(); } );
+
+    openWorkspaceAction = new QAction( tr( action::openWorkspaceText ), this );
+    openWorkspaceAction->setStatusTip( tr( action::openWorkspaceStatusTip ) );
+    connect( openWorkspaceAction, &QAction::triggered, this,
+             [ this ]( auto ) { this->openWorkspace(); } );
+
+    addFolderToWorkspaceAction = new QAction( tr( action::addFolderToWorkspaceText ), this );
+    addFolderToWorkspaceAction->setStatusTip( tr( action::addFolderToWorkspaceStatusTip ) );
+    connect( addFolderToWorkspaceAction, &QAction::triggered, this,
+             [ this ]( auto ) { this->addFolderToWorkspace(); } );
+
+    saveWorkspaceAsAction = new QAction( tr( action::saveWorkspaceAsText ), this );
+    saveWorkspaceAsAction->setStatusTip( tr( action::saveWorkspaceAsStatusTip ) );
+    saveWorkspaceAsAction->setEnabled( false );
+    connect( saveWorkspaceAsAction, &QAction::triggered, this,
+             [ this ]( auto ) { this->saveWorkspaceAs(); } );
+
+    closeWorkspaceAction = new QAction( tr( action::closeWorkspaceText ), this );
+    closeWorkspaceAction->setStatusTip( tr( action::closeWorkspaceStatusTip ) );
+    // VS Code chord: Ctrl+K F
+    closeWorkspaceAction->setShortcut( QKeySequence( QStringLiteral( "Ctrl+K, F" ) ) );
+    closeWorkspaceAction->setEnabled( false );
+    connect( closeWorkspaceAction, &QAction::triggered, this,
+             [ this ]( auto ) { this->closeWorkspace(); } );
+
+    recentWorkspacesGroup = new QActionGroup( this );
+    connect( recentWorkspacesGroup, &QActionGroup::triggered, this,
+             &MainWindow::openRecentWorkspace );
+
+    recentWorkspacesCleanup = new QAction( tr( action::recentWorkspacesCleanupText ), this );
+    connect( recentWorkspacesCleanup, &QAction::triggered, this, [ this ]( auto ) {
+        auto& recent = RecentWorkspaces::getSynced();
+        recent.removeAll();
+        recent.save();
+        updateRecentWorkspacesMenu();
+    } );
 
     recentFilesCleanup = new QAction( tr( action::recentFilesCleanupText ), this );
     connect( recentFilesCleanup, &QAction::triggered, this,
@@ -876,15 +1258,25 @@ void MainWindow::createMenus()
     fileMenu->setToolTipsVisible( true );
     fileMenu->addAction( newWindowAction );
     fileMenu->addAction( openAction );
+    fileMenu->addAction( openFolderAction );
+    fileMenu->addAction( openWorkspaceAction );
     fileMenu->addAction( openClipboardAction );
     fileMenu->addAction( openUrlAction );
-    recentFilesMenu = fileMenu->addMenu( tr( "Open Recent" ) );
+    recentFilesMenu = fileMenu->addMenu( tr( menu::recentFilesTitle ) );
     for ( auto i = 0u; i < recentFileActions.size(); ++i ) {
         recentFilesMenu->addAction( recentFileActions[ i ] );
     }
     recentFilesMenu->addSeparator();
     recentFilesMenu->addAction( recentFilesCleanup );
     recentFilesMenu->setEnabled( false );
+    recentWorkspacesMenu = fileMenu->addMenu( tr( menu::recentWorkspacesTitle ) );
+    recentWorkspacesMenu->setToolTipsVisible( true );
+    recentWorkspacesMenu->setEnabled( false );
+    fileMenu->addSeparator();
+
+    fileMenu->addAction( addFolderToWorkspaceAction );
+    fileMenu->addAction( saveWorkspaceAsAction );
+    fileMenu->addAction( closeWorkspaceAction );
     fileMenu->addSeparator();
 
     fileMenu->addAction( closeAction );
@@ -1089,7 +1481,8 @@ void MainWindow::open()
     }
 
     const auto selectedFiles = QFileDialog::getOpenFileUrls(
-        this, tr( "Open file" ), QUrl::fromLocalFile( defaultDir ), tr( "All files (*)" ) );
+        this, tr( "Open file" ), QUrl::fromLocalFile( defaultDir ),
+        tr( "All files (*);;Workspace files (*.%1)" ).arg( Workspace::FileExtension ) );
 
     std::vector<QUrl> localFiles;
     std::vector<QUrl> remoteFiles;
@@ -1099,7 +1492,7 @@ void MainWindow::open()
                          []( const QUrl& url ) { return url.isLocalFile(); } );
 
     for ( const auto& localFile : localFiles ) {
-        loadFile( localFile.toLocalFile() );
+        openPath( localFile.toLocalFile() );
     }
 
     for ( const auto& remoteFile : remoteFiles ) {
@@ -1651,7 +2044,7 @@ void MainWindow::loadFileNonInteractive( const QString& file_name )
 {
     LOG_DEBUG << "loadFileNonInteractive( " << file_name.toStdString() << " )";
 
-    loadFile( file_name );
+    openPath( file_name );
 
     // Try to get the window to the front
     // This is a bit of a hack but has been tested on:
@@ -1764,8 +2157,9 @@ void MainWindow::dropEvent( QDropEvent* event )
         if ( fileName.isEmpty() )
             continue;
 
-        // Files dropped in should follow (auto-refresh) by default.
-        loadFile( fileName, true );
+        // Folders and .code-workspace files open as a workspace; files
+        // dropped in should follow (auto-refresh) by default.
+        openPath( fileName, true );
     }
 }
 
@@ -1999,6 +2393,12 @@ void MainWindow::updateTitleBar( const QString& file_name )
     QString indexPart = "";
     if ( session_.windowIndex() > 0 ) {
         indexPart = QString( " #%1" ).arg( session_.windowIndex() + 1 );
+    }
+
+    // VS Code: "<file> - <workspace> - <app>"
+    const auto workspaceName = workspace_.name();
+    if ( !workspaceName.isEmpty() ) {
+        shownName = QStringLiteral( "%1 - %2" ).arg( shownName, workspaceName );
     }
 
     setWindowTitle( tr( "%1 - %2%3" ).arg( shownName, tr( "klogg" ), indexPart ) + tr( " (build " )
@@ -2363,6 +2763,7 @@ void MainWindow::writeSettings()
         widget_list.emplace_back( view, 0UL, view->context() );
     }
     session_.save( widget_list, saveGeometry() );
+    session_.saveState( saveState() );
 }
 
 // Read settings from permanent storage
@@ -2378,6 +2779,9 @@ void MainWindow::readSettings()
     // History of recent files
     RecentFiles::getSynced();
     updateRecentFileActions();
+
+    RecentWorkspaces::getSynced();
+    updateRecentWorkspacesMenu();
 
     FavoriteFiles::getSynced();
     updateFavoritesMenu();

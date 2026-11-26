@@ -20,16 +20,19 @@
 #include <catch2/catch.hpp>
 
 #include <QSignalSpy>
+#include <QTemporaryDir>
 #include <QTemporaryFile>
 #include <QTest>
 
 #include <QToolBar>
+#include <QTreeWidget>
 
 #include "test_utils.h"
 
 #include "log.h"
 #include "mainwindow.h"
 #include "session.h"
+#include "workspaceexplorer.h"
 
 SCENARIO( "Main window tests", "[ui]" )
 {
@@ -123,6 +126,52 @@ SCENARIO( "Main window tests", "[ui]" )
                     {
                         REQUIRE( waitUiState( [&] { return filePathLabel->text().isEmpty(); } ) );
                     }
+                }
+            }
+        }
+        WHEN( "Open a folder as workspace" )
+        {
+            QTemporaryDir workspaceDir;
+            REQUIRE( workspaceDir.isValid() );
+            REQUIRE( QFile( workspaceDir.filePath( "a.log" ) ).open( QIODevice::WriteOnly ) );
+
+            runInUiThread( [&mainWindow, dir = workspaceDir.path()] {
+                mainWindow->openFolderAsWorkspace( dir );
+            } );
+
+            auto* explorer = mainWindow->findChild<WorkspaceExplorer*>();
+            REQUIRE( explorer != nullptr );
+            auto* tree = explorer->findChild<QTreeWidget*>();
+            REQUIRE( tree != nullptr );
+
+            THEN( "Explorer shows the folder as root and opens it" )
+            {
+                REQUIRE( waitUiState( [&] { return tree->topLevelItemCount() == 1; } ) );
+                REQUIRE( tree->topLevelItem( 0 )->text( 0 )
+                         == QFileInfo( workspaceDir.path() ).fileName() );
+                REQUIRE( tree->topLevelItem( 0 )->isExpanded() );
+                REQUIRE( explorer->isVisible() );
+
+                AND_THEN( "Files can be opened from the tree" )
+                {
+                    // First child may be "a.log"; activating it opens a tab.
+                    runInUiThread( [&] {
+                        auto* root = tree->topLevelItem( 0 );
+                        REQUIRE( root->childCount() == 1 );
+                        QTest::mouseClick( tree->viewport(), Qt::LeftButton, Qt::NoModifier,
+                                           tree->visualItemRect( root->child( 0 ) ).center() );
+                    } );
+                    REQUIRE( waitUiState( [&] { return tabArea->count() == 1; } ) );
+                }
+            }
+
+            AND_WHEN( "Close the workspace" )
+            {
+                runInUiThread( [&mainWindow] { mainWindow->closeWorkspace(); } );
+
+                THEN( "Explorer is empty again" )
+                {
+                    REQUIRE( waitUiState( [&] { return tree->topLevelItemCount() == 0; } ) );
                 }
             }
         }
